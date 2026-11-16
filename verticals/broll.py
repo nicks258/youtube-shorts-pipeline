@@ -1,6 +1,7 @@
 """Gemini Imagen b-roll generation + Ken Burns animation."""
 
 import base64
+import os
 from pathlib import Path
 
 import requests
@@ -14,9 +15,10 @@ from .retry import with_retry
 @with_retry(max_retries=3, base_delay=2.0)
 def _generate_image_gemini(prompt: str, output_path: Path, api_key: str):
     """Generate image via Gemini native image generation (free tier compatible)."""
+    model = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
     url = (
         "https://generativelanguage.googleapis.com/v1beta"
-        "/models/gemini-2.0-flash-exp-image-generation:generateContent"
+        f"/models/{model}:generateContent"
     )
     body = {
         "contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}],
@@ -128,3 +130,36 @@ def animate_frame(img_path: Path, out_path: Path, duration: float, effect: str =
         "-vf", vf, "-t", str(duration), "-r", str(fps),
         "-pix_fmt", "yuv420p", str(out_path), "-y", "-loglevel", "quiet",
     ])
+
+
+# --- free-images patch v2 ---
+import time as _time
+import urllib.parse as _urlparse
+
+
+def _generate_image_pollinations(prompt, output_path):
+    url = (
+        "https://image.pollinations.ai/prompt/"
+        + _urlparse.quote(prompt[:400], safe="")
+        + f"?width={VIDEO_WIDTH}&height={VIDEO_HEIGHT}&model=flux&nologo=true"
+        + f"&seed={int(_time.time())}"
+    )
+    last_error = None
+    for attempt in range(2):
+        try:
+            r = requests.get(url, timeout=70)
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+                output_path.write_bytes(r.content)
+                return
+            last_error = f"HTTP {r.status_code}"
+        except Exception as e:  # network errors, timeouts
+            last_error = str(e)
+        _time.sleep(8)
+    raise RuntimeError(f"Pollinations failed: {last_error}")
+
+
+def _generate_image_gemini(prompt, output_path, api_key):
+    # Pollinations only: the pipeline's old Gemini image model has been shut down
+    _generate_image_pollinations(prompt, output_path)
+    log("Image generated with Pollinations")
+    _time.sleep(12)  # stay under the anonymous rate limit (about 1 image per 15 s)

@@ -11,6 +11,17 @@ MUSIC_DIR = Path(__file__).resolve().parent.parent / "music"
 
 def _find_tracks() -> list[Path]:
     """Find all MP3 tracks in the music/ directory."""
+    # prepare-music fallback patch
+    if not MUSIC_DIR.exists() or not list(MUSIC_DIR.glob("*.mp3")):
+        try:
+            from .prepare_music import prepare_music
+            prepare_music()
+        except Exception:
+            try:
+                from prepare_music import prepare_music
+                prepare_music()
+            except Exception:
+                pass
     if not MUSIC_DIR.exists():
         return []
     return sorted(MUSIC_DIR.glob("*.mp3"))

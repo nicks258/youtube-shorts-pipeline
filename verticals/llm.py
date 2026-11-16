@@ -159,15 +159,17 @@ def _call_gemini(prompt: str, max_tokens: int) -> str:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
 
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
     url = (
         "https://generativelanguage.googleapis.com/v1beta"
-        "/models/gemini-2.0-flash:generateContent"
+        f"/models/{model}:generateContent"
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "maxOutputTokens": max_tokens,
+            "maxOutputTokens": max(max_tokens, 4096),
             "temperature": 0.7,
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
     r = requests.post(
@@ -291,3 +293,12 @@ def _call_litellm(prompt: str, max_tokens: int) -> str:
     if not content:
         raise RuntimeError("Empty response from LiteLLM")
     return content.strip()
+
+
+# --- gemini-model patch ---
+
+
+def _call_gemini(prompt: str, max_tokens: int) -> str:
+    """Gemini call that auto-picks a model that still exists (see gemini_model.py)."""
+    from .gemini_model import generate
+    return generate([{"text": prompt}], max_tokens=max_tokens, temperature=0.7)

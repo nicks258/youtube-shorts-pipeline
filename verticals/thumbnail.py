@@ -1,6 +1,7 @@
 """Thumbnail generation — Gemini Imagen (16:9) + Pillow text overlay."""
 
 import base64
+import os
 from pathlib import Path
 
 import requests
@@ -17,9 +18,10 @@ THUMB_HEIGHT = 720
 @with_retry(max_retries=3, base_delay=2.0)
 def _generate_thumb_image(prompt: str, output_path: Path, api_key: str):
     """Generate a 16:9 thumbnail via Gemini native image generation."""
+    model = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
     url = (
         "https://generativelanguage.googleapis.com/v1beta"
-        "/models/gemini-2.0-flash-exp-image-generation:generateContent"
+        f"/models/{model}:generateContent"
     )
     body = {
         "contents": [{"parts": [{"text": f"Generate a 16:9 landscape image: {prompt}"}]}],

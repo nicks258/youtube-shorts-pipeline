@@ -72,7 +72,17 @@ def _generate_edge_tts(script: str, out_dir: Path, lang: str, voice_override: st
                 future.result(timeout=60)
         except RuntimeError:
             # No running loop, safe to use asyncio.run
-            asyncio.run(_edge_tts_generate(script, voice, out_path))
+            # edge-tts retry patch
+            import time as _t
+            for _try in range(4):
+                try:
+                    asyncio.run(_edge_tts_generate(script, voice, out_path))
+                    break
+                except Exception as _e:
+                    if _try == 3:
+                        raise
+                    log(f"Edge TTS try {_try + 1}/4 failed ({_e}) -- retrying in {10 * (_try + 1)} s")
+                    _t.sleep(10 * (_try + 1))
 
         log(f"Edge TTS voiceover saved: {out_path.name}")
         return out_path
@@ -452,3 +462,31 @@ def generate_voiceover(
         return _generate_say(script, out_dir)
 
     raise ValueError(f"Unknown TTS provider: {provider}")
+
+
+# --- kokoro-tts patch ---
+
+
+_original_generate_voiceover = generate_voiceover
+
+
+def generate_voiceover(
+    script: str,
+    out_dir: Path,
+    lang: str = "en",
+    provider: str | None = None,
+    voice_config: dict | None = None,
+) -> Path:
+    p = (provider or os.environ.get("TTS_PROVIDER", "")).strip().lower()
+    if p == "kokoro":
+        try:
+            from .kokoro_tts import generate_kokoro
+            return generate_kokoro(script, out_dir, lang)
+        except Exception as e:
+            log(f"WARNING: Kokoro failed ({e}) -- falling back to Edge TTS")
+            return _original_generate_voiceover(
+                script, out_dir, lang, provider="edge", voice_config=voice_config
+            )
+    return _original_generate_voiceover(
+        script, out_dir, lang, provider=provider, voice_config=voice_config
+    )

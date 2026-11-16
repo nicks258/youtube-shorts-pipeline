@@ -66,11 +66,11 @@ def cmd_draft(args):
 
 
 def cmd_produce(args):
-    from .broll import generate_broll
+    from .stock_visuals import generate_visuals as generate_broll
     from .tts import generate_voiceover
     from .captions import generate_captions
     from .music import select_and_prepare_music
-    from .assemble import assemble_video
+    from .stock_visuals import assemble_video
     from .niche import load_niche, get_voice_config, get_caption_config, get_music_config
     from .state import PipelineState
     import json
@@ -100,7 +100,7 @@ def cmd_produce(args):
 
     # B-roll
     if force or not state.is_done("broll"):
-        frames = generate_broll(draft.get("broll_prompts", ["Cinematic landscape"] * 3), work_dir)
+        frames = generate_broll(draft.get("broll_prompts", ["Cinematic landscape"] * 3), work_dir, script=script, title=draft.get("youtube_title", ""), draft=draft)
         state.complete_stage("broll", {"frames": [str(f) for f in frames]})
     else:
         log("Skipping b-roll (already done)")
@@ -124,7 +124,7 @@ def cmd_produce(args):
         vo_path = Path(state.get_artifact("voiceover", "path"))
 
     # Whisper + Captions (niche-aware styling)
-    caption_config = get_caption_config(profile)
+    caption_config = {**get_caption_config(profile), "words_per_group": int(__import__("os").environ.get("CAPTION_WORDS", "3"))}
     if force or not state.is_done("captions"):
         captions_result = generate_captions(
             vo_path, work_dir, lang,
@@ -452,7 +452,8 @@ def main():
             sys.exit(1)
 
         if getattr(args, "auto_pick", False):
-            args.news = engine.auto_pick(candidates)
+            provider = getattr(args, "provider", None)
+            args.news = engine.auto_pick(candidates, provider=provider)
             print(f"  Auto-picked: {args.news}")
         else:
             print("\n  Trending topics:\n")

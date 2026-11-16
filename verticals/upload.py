@@ -1,6 +1,7 @@
 """YouTube API upload + thumbnail + captions."""
 
 from pathlib import Path
+import os
 
 from .config import get_youtube_token_path, write_secret_file
 from .log import log
@@ -36,16 +37,19 @@ def upload_to_youtube(
     youtube = build("youtube", "v3", credentials=creds)
     log(f"Uploading {video_path.name}...")
 
+    cat_id = str(draft.get("yt_category_id") or os.environ.get("YT_CATEGORY_ID") or "27")
+    privacy = str(draft.get("privacy_status") or os.environ.get("PRIVACY_STATUS") or "public")
+
     body = {
         "snippet": {
             "title": draft.get("youtube_title", draft["news"])[:100],
             "description": draft.get("youtube_description", ""),
-            "tags": draft.get("youtube_tags", "").split(","),
-            "categoryId": "20",
+            "tags": [t.strip() for t in draft.get("youtube_tags", "").split(",") if t.strip()],
+            "categoryId": cat_id,
             "defaultLanguage": lang,
             "defaultAudioLanguage": lang,
         },
-        "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False},
+        "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }
 
     media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)

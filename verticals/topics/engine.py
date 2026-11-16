@@ -105,8 +105,8 @@ class TopicEngine:
         unique.sort(key=lambda t: t.trending_score, reverse=True)
         return unique[:limit]
 
-    def auto_pick(self, candidates: list[TopicCandidate]) -> str:
-        """Use Claude to pick the best topic for a YouTube Short."""
+    def auto_pick(self, candidates: list[TopicCandidate], provider: str | None = None) -> str:
+        """Use configured LLM provider to pick the best topic for a YouTube Short."""
         topics_text = "\n".join(
             f"{i+1}. [{t.source}] {t.title} (score: {t.trending_score:.2f})"
             for i, t in enumerate(candidates[:20])
@@ -119,14 +119,5 @@ Consider: visual potential, broad appeal, timeliness, controversy/surprise facto
 
 Reply with ONLY the topic title text, nothing else."""
 
-        backend = get_claude_backend()
-        if backend == "api":
-            client = get_anthropic_client()
-            msg = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return msg.content[0].text.strip()
-        else:
-            return call_claude_cli(prompt, max_tokens=200)
+        from ..llm import call_llm
+        return call_llm(prompt, provider=provider, max_tokens=200).strip()

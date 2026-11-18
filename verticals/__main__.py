@@ -205,6 +205,9 @@ def cmd_upload(args):
     lang = args.lang
     state = PipelineState(draft)
     force = getattr(args, "force", False)
+    privacy = getattr(args, "privacy", None)
+    if privacy:
+        draft["privacy_status"] = privacy
 
     video_path = Path(draft.get(f"video_{lang}", ""))
     srt_path_str = draft.get(f"srt_{lang}")
@@ -260,6 +263,7 @@ def cmd_run(args):
         draft = str(draft_path)
         lang = args.lang
         force = False
+        privacy = getattr(args, "privacy", None)
 
     url = cmd_upload(UploadArgs())
     print(f"\n  Done! {url}")
@@ -396,6 +400,7 @@ def main():
     p_upload.add_argument("--draft", required=True)
     p_upload.add_argument("--lang", default="en", choices=["en", "hi", "es", "pt", "de", "fr", "ja", "ko"])
     p_upload.add_argument("--force", action="store_true", help="Re-upload even if done")
+    p_upload.add_argument("--privacy", default=None, choices=["private", "unlisted", "public"], help="Upload privacy status (default: private)")
 
     # run (full pipeline)
     p_run = sub.add_parser("run", help="Full pipeline: draft -> produce -> upload")
@@ -405,6 +410,7 @@ def main():
     p_run.add_argument("--provider", default=None, help="LLM: claude, gemini, openai, ollama")
     p_run.add_argument("--voice", default=None, help="TTS: edge, elevenlabs, 60db, say")
     p_run.add_argument("--lang", default="en", choices=["en", "hi", "es", "pt", "de", "fr", "ja", "ko"])
+    p_run.add_argument("--privacy", default=None, choices=["private", "unlisted", "public"], help="Upload privacy status (default: private)")
     p_run.add_argument("--dry-run", action="store_true")
     p_run.add_argument("--context", default="")
     p_run.add_argument("--discover", action="store_true")

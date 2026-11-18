@@ -115,8 +115,8 @@ def generate_kokoro(script: str, out_dir: Path, lang: str = "en") -> Path:
     voice = os.environ.get("KOKORO_VOICE", "am_michael").strip() or "am_michael"
     speed = float(os.environ.get("KOKORO_SPEED", "1.0"))
 
-    # "a" for American English, "b" for British English
-    lang_code = "b" if voice.startswith("b") else "a"
+    # "a" for American English, "b" for British English (or KOKORO_LANG if set)
+    lang_code = os.environ.get("KOKORO_LANG", "").strip() or ("b" if voice.startswith("b") else "a")
 
     if lang_code == "b":
         log(f"Generating {lang} voiceover via Kokoro (voice: {voice}, speed: {speed}) -- British pronunciation mode (lang_code \"b\")...")

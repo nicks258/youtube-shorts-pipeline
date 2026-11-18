@@ -196,7 +196,7 @@ def _guard_draft(raw: str, retry, attempts: int = 2) -> dict:
     import re
 
     def usable(d):
-        return isinstance(d, dict) and isinstance(d.get("script"), str) and d["script"].strip()
+        return isinstance(d, dict) and bool(str(d.get("script", "") or "").strip())
 
     def parse(text):
         t = (text or "").strip()
@@ -220,7 +220,7 @@ def _guard_draft(raw: str, retry, attempts: int = 2) -> dict:
             if usable(v):
                 return v
         for k in list(d):  # "Script", "script " ...
-            if k.strip().lower() == "script" and isinstance(d[k], str) and d[k].strip():
+            if k.strip().lower() == "script" and bool(str(d[k] or "").strip()):
                 d["script"] = d.pop(k)
                 return d
         return None

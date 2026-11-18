@@ -535,12 +535,15 @@ def _restyle_captions(ass_path: str, hook: str, out_dir: Path) -> str:
                   f"&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,8,4,8,70,70,260,1")
     watermark_style = (f"Style: Watermark,{CAPTION_FONT},38,&H60FFFFFF,&H000000FF,&H90000000,"
                        f"&H00000000,-1,0,0,0,100,100,2,0,1,2,0,8,60,60,150,1")
+    skip_captions = os.environ.get("CAPTIONS") == "0"
     out = []
     for line in lines:
         if line.startswith("Style: Default"):
             out += [style, hook_style]
             if WATERMARK_TEXT:
                 out.append(watermark_style)
+        elif skip_captions and line.startswith("Dialogue:"):
+            continue
         else:
             out.append(line)
     if hook:

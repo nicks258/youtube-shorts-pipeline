@@ -1371,6 +1371,8 @@ def build_story_vars(scenes: list[dict], voiceover_path: Path, title: str, scrip
 
     watermark = os.environ.get("WATERMARK_TEXT", "@reelunseenfacts").strip() or "@reelunseenfacts"
 
+    skip_captions = os.environ.get("CAPTIONS") == "0"
+
     vars_dict = {
         "duration": round(duration, 2),
         "title": title or "Unseen Facts",
@@ -1381,7 +1383,7 @@ def build_story_vars(scenes: list[dict], voiceover_path: Path, title: str, scrip
         "accent": accent or "#FFD666",
         "texture": texture or "",
         "category": category or "General",
-        "words": words,
+        "words": [] if skip_captions else words,
         "scenes": aligned_scenes
     }
     return vars_dict

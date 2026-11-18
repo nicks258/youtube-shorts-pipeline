@@ -38,7 +38,7 @@ def upload_to_youtube(
     log(f"Uploading {video_path.name}...")
 
     cat_id = str(draft.get("yt_category_id") or os.environ.get("YT_CATEGORY_ID") or "27")
-    privacy = str(draft.get("privacy_status") or os.environ.get("PRIVACY_STATUS") or "public")
+    privacy = str(draft.get("privacy_status") or os.environ.get("PRIVACY_STATUS") or "private")
 
     body = {
         "snippet": {

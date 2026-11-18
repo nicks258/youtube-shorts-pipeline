@@ -1,0 +1,83 @@
+{
+  "_how_this_works": "Dubbed audio tracks for the English Short. Set \"enabled\": true for the languages you want; make_dubs.py writes one audio file per enabled language into out/dubs/, and you add them in YouTube Studio (Languages page). Kokoro quality varies a lot by language: listen to each one before you publish it. \"grade\" is Kokoro's own quality grade for that voice (A is best); \"needs\" lists extra pip packages.",
+  "source_language": "en",
+  "languages": {
+    "hi": {
+      "enabled": true,
+      "name": "Hindi",
+      "native_name": "हिन्दी",
+      "kokoro_lang": "h",
+      "voices": ["hf_alpha", "hf_beta", "hm_omega", "hm_psi"],
+      "voice": "hm_omega",
+      "grade": "C",
+      "youtube_language": "hi",
+      "needs": []
+    },
+    "es": {
+      "enabled": false,
+      "name": "Spanish",
+      "native_name": "Español",
+      "kokoro_lang": "e",
+      "voices": ["ef_dora", "em_alex", "em_santa"],
+      "voice": "em_alex",
+      "grade": "C",
+      "youtube_language": "es",
+      "needs": []
+    },
+    "pt": {
+      "enabled": false,
+      "name": "Brazilian Portuguese",
+      "native_name": "Português (Brasil)",
+      "kokoro_lang": "p",
+      "voices": ["pf_dora", "pm_alex", "pm_santa"],
+      "voice": "pm_alex",
+      "grade": "C",
+      "youtube_language": "pt-BR",
+      "needs": []
+    },
+    "fr": {
+      "enabled": false,
+      "name": "French",
+      "native_name": "Français",
+      "kokoro_lang": "f",
+      "voices": ["ff_siwis"],
+      "voice": "ff_siwis",
+      "grade": "B-",
+      "youtube_language": "fr",
+      "needs": []
+    },
+    "it": {
+      "enabled": false,
+      "name": "Italian",
+      "native_name": "Italiano",
+      "kokoro_lang": "i",
+      "voices": ["if_sara", "im_nicola"],
+      "voice": "im_nicola",
+      "grade": "C",
+      "youtube_language": "it",
+      "needs": []
+    },
+    "ja": {
+      "enabled": false,
+      "name": "Japanese",
+      "native_name": "日本語",
+      "kokoro_lang": "j",
+      "voices": ["jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"],
+      "voice": "jf_alpha",
+      "grade": "C+",
+      "youtube_language": "ja",
+      "needs": ["misaki[ja]"]
+    },
+    "zh": {
+      "enabled": false,
+      "name": "Mandarin Chinese",
+      "native_name": "中文",
+      "kokoro_lang": "z",
+      "voices": ["zf_xiaobei", "zf_xiaoni", "zm_yunjian", "zm_yunxi"],
+      "voice": "zm_yunxi",
+      "grade": "C",
+      "youtube_language": "zh-CN",
+      "needs": ["misaki[zh]"]
+    }
+  }
+}

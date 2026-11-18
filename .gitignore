@@ -12,6 +12,7 @@ youtube_token.json
 drafts/
 media/
 logs/
+out/
 
 # Python
 __pycache__/
@@ -35,3 +36,4 @@ music/
 my-shorts-bot/
 .agents/
 
+voice-samples/

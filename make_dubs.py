@@ -1,9 +1,9 @@
 """Make dubbed audio tracks for the Short that was just produced.
 
 For every language enabled in languages.json this:
-  1. translates the script with Gemini Flash Lite, aiming at a spoken length that
-     matches the English audio,
-  2. speaks it with Kokoro in that language's voice,
+  1. translates the script with Gemini Flash Lite, aiming at a target word count
+     calculated from the video duration and that language's words_per_second,
+  2. speaks it with the configured provider (gemini or kokoro),
   3. fits the result to the video's exact duration (YouTube requires each audio
      track to be roughly the same length as the video),
   4. writes out/dubs/<code>.m4a plus translated title/description.
@@ -12,10 +12,12 @@ YouTube has no API for multi-language audio, so the files are added by hand in
 YouTube Studio -> Languages. out/dubs/INSTRUCTIONS.txt lists the steps and the
 translated metadata for each language.
 
-Env: GEMINI_API_KEY, TOPIC_CATEGORY (optional), DUB_LANGUAGES (optional
-comma-separated override, e.g. "hi,es"), SKIP_DUBS=1 to do nothing.
+Env: GEMINI_API_KEY, GEMINI_TTS_STYLE (optional), TOPIC_CATEGORY (optional),
+DUB_LANGUAGES (optional comma-separated override, e.g. "hi,es"),
+SKIP_DUBS=1 to do nothing.
 Usage: python make_dubs.py [path to the video]
 """
+import base64
 import json
 import os
 import pathlib
@@ -23,6 +25,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import requests
 
 ROOT = pathlib.Path(__file__).resolve().parent
 if (ROOT / "pipeline").exists():
@@ -30,6 +34,9 @@ if (ROOT / "pipeline").exists():
 if (ROOT.parent / "verticals").exists():
     sys.path.insert(0, str(ROOT.parent))
 sys.path.insert(0, str(ROOT))
+
+if "/opt/homebrew/bin" not in os.environ.get("PATH", "") and pathlib.Path("/opt/homebrew/bin").exists():
+    os.environ["PATH"] = f"/opt/homebrew/bin:{os.environ.get('PATH', '')}"
 
 LANGS_FILE = ROOT / "languages.json"
 DRAFTS = pathlib.Path.home() / ".verticals" / "drafts"
@@ -100,7 +107,7 @@ def render_track(src: pathlib.Path, dest: pathlib.Path, plan: dict, target: floa
                     "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "1", str(dest)], check=True)
 
 
-# ---------------------------------------------------------------- Gemini
+# ---------------------------------------------------------------- Gemini translation
 
 def gemini(prompt: str, max_tokens: int = 2000) -> str:
     try:
@@ -119,7 +126,7 @@ Rules:
 - Natural spoken {lang['name']}, the way a narrator would say it, not a literal translation.
 - Write in {lang['name']} standard script ({lang['native_name']}). {script_hint}
 - Keep the same facts, numbers and order. Keep the hook punchy.
-- Aim for about {target_words} words so it takes the same time to say as the English.
+- Target word count: aim for {target_words} words (maximum {target_words} words). Keep sentences tight and concise so it does not exceed {target_words} words.
 - Write numbers as words where a speaker would say them.
 - No emoji, no hashtags, no notes, no quotation marks around the whole text.
 
@@ -149,23 +156,97 @@ Reply with ONLY JSON: {{"title": "...", "description": "..."}}""")
         return {"title": "", "description": ""}
 
 
-# ---------------------------------------------------------------- speech
+# ---------------------------------------------------------------- speech providers
 
-def speak(script: str, lang: dict, work: pathlib.Path) -> pathlib.Path:
+def speak_kokoro(script: str, lang: dict, work: pathlib.Path) -> pathlib.Path:
     """Use the pipeline's Kokoro helper with this language's voice."""
     try:
         from kokoro_tts import generate_kokoro
     except ImportError:
         from verticals.kokoro_tts import generate_kokoro
     work.mkdir(parents=True, exist_ok=True)
+    voice = lang.get("voice") or "hm_omega"
+    kokoro_lang = lang.get("kokoro_lang") or voice[0]
     before = dict(os.environ)
-    os.environ["KOKORO_VOICE"] = lang["voice"]
-    os.environ["KOKORO_LANG"] = lang["kokoro_lang"]
+    os.environ["KOKORO_VOICE"] = voice
+    os.environ["KOKORO_LANG"] = kokoro_lang
     try:
-        return pathlib.Path(generate_kokoro(script, work, lang["code"]))
+        return pathlib.Path(generate_kokoro(script, work, lang.get("code", "hi")))
     finally:
         os.environ.clear()
         os.environ.update(before)
+
+
+def speak_gemini(script: str, lang: dict, work: pathlib.Path) -> pathlib.Path:
+    """Use Gemini TTS model with prebuilt voices (e.g. Puck, Kore)."""
+    try:
+        from verticals.config import get_gemini_key
+        key = get_gemini_key()
+    except Exception:
+        key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        raise ValueError("GEMINI_API_KEY not found")
+
+    voice = lang.get("provider_voice") or "Puck"
+    models = [lang.get("gemini_tts_model"), "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"]
+    models = list(dict.fromkeys([m for m in models if m]))
+
+    style = os.environ.get("GEMINI_TTS_STYLE", "natural, engaging narration at a normal pace").strip()
+    prompt_text = f"Style: {style}.\n\nRead the following text aloud:\n{script}"
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": voice
+                    }
+                }
+            }
+        }
+    }
+
+    last_err = None
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        res = requests.post(url, json=payload, timeout=60)
+        if res.status_code == 200:
+            data = res.json()
+            part = data["candidates"][0]["content"]["parts"][0]
+            pcm_bytes = base64.b64decode(part["inlineData"]["data"])
+            pcm_path = work / f"gemini_{voice}.pcm"
+            pcm_path.write_bytes(pcm_bytes)
+            wav_path = work / f"gemini_{voice}.wav"
+            subprocess.run(["ffmpeg", "-y", "-i", str(pcm_path), str(wav_path)], check=True)
+            try:
+                pcm_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return wav_path
+        else:
+            last_err = f"{model} failed ({res.status_code}): {res.text[:200]}"
+            log(f"Gemini {model} returned {res.status_code}, trying fallback model...")
+
+    raise RuntimeError(last_err or "Gemini TTS failed")
+
+
+def speak(script: str, lang: dict, work: pathlib.Path) -> pathlib.Path:
+    """Dispatcher for TTS: gemini or kokoro with automatic Kokoro fallback."""
+    provider = lang.get("provider", "kokoro").lower()
+    work.mkdir(parents=True, exist_ok=True)
+
+    if provider == "gemini":
+        try:
+            voice_name = lang.get("provider_voice") or "Puck"
+            log(f"speaking with Gemini TTS ({voice_name})...")
+            return speak_gemini(script, lang, work)
+        except Exception as e:
+            log(f"Gemini TTS failed ({e}), falling back to Kokoro")
+            return speak_kokoro(script, lang, work)
+
+    return speak_kokoro(script, lang, work)
 
 
 # ---------------------------------------------------------------- main
@@ -219,7 +300,6 @@ def main():
     if not script:
         log("the draft has no script, nothing to do")
         return
-    english_words = len(script.split())
 
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -227,26 +307,36 @@ def main():
     results = []
 
     for lang in langs:
-        log(f"{lang['name']} ({lang['voice']})...")
-        entry = {"code": lang["code"], "name": lang["name"], "voice": lang["voice"],
+        provider = lang.get("provider", "kokoro")
+        voice = lang.get("provider_voice") or lang.get("voice", "")
+        wps = float(lang.get("words_per_second", 2.5))
+        log(f"{lang['name']} [{provider}: {voice}] (target: {target:.2f}s, wps: {wps})...")
+        entry = {"code": lang["code"], "name": lang["name"], "provider": provider, "voice": voice,
                  "youtube_language": lang.get("youtube_language", lang["code"]), "ok": False}
+        retries = 0
         try:
-            words = english_words
+            target_words = round(target * wps * 0.97)
+            words = target_words
             for attempt in range(MAX_TRANSLATION_TRIES):
+                retries = attempt
                 text = translate_script(script, lang, words)
                 raw = speak(text, lang, WORK / lang["code"])
                 spoken = duration_of(raw)
                 plan = fit_plan(spoken, target)
-                if plan["ok"] or attempt == MAX_TRANSLATION_TRIES - 1:
+                within_5pct = (0.97 <= plan["tempo"] <= 1.03) or (abs(spoken - target) / target <= 0.05)
+                if (plan["ok"] and within_5pct) or attempt == MAX_TRANSLATION_TRIES - 1:
                     break
-                words = max(20, int(words * target / spoken * 0.95))
-                log(f"  {lang['name']}: {spoken:.1f}s vs {target:.1f}s, retrying with ~{words} words")
+                words = max(20, int(words * target / spoken * 0.97))
+                log(f"  {lang['name']}: {spoken:.1f}s vs {target:.1f}s (speed x{plan['tempo']:.3f}), retrying with ~{words} words")
+                time.sleep(2)
+
             dest = OUT / f"{lang['code']}.m4a"
             render_track(raw, dest, plan, target)
             meta = translate_meta(draft.get("youtube_title", ""), draft.get("youtube_description", ""), lang)
             entry.update(ok=True, file=dest.name, script=text, seconds=round(duration_of(dest), 2),
-                         fit=plan["note"], fit_clean=plan["ok"], **meta)
-            log(f"  {lang['name']}: {entry['seconds']}s ({plan['note']})")
+                         target_words=target_words, raw_seconds=round(spoken, 2), retries=retries,
+                         tempo=round(plan["tempo"], 3), fit=plan["note"], fit_clean=plan["ok"], **meta)
+            log(f"  {lang['name']}: raw={spoken:.2f}s, final={entry['seconds']}s (speed x{plan['tempo']:.3f}, retries={retries})")
             if not plan["ok"]:
                 log(f"  WARNING {lang['name']}: {plan['note']}")
         except Exception as e:
@@ -274,7 +364,7 @@ def main():
         if not r["ok"]:
             lines += [f"{r['name']}: FAILED ({r.get('error', 'unknown')})", ""]
             continue
-        lines += [f"{r['name']} ({r['youtube_language']}) -> {r['file']}  [{r['seconds']}s, {r['fit']}]",
+        lines += [f"{r['name']} ({r['youtube_language']}) [{r.get('provider', 'kokoro')}: {r['voice']}] -> {r['file']}  [{r['seconds']}s, {r['fit']}]",
                   "" if r["fit_clean"] else "  WARNING: length does not match well; check before uploading.",
                   f"TITLE: {r.get('title', '')}", "", "DESCRIPTION:", r.get("description", ""), ""]
     (OUT / "INSTRUCTIONS.txt").write_text("\n".join(lines), encoding="utf-8")

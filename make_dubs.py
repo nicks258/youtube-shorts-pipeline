@@ -112,10 +112,12 @@ def gemini(prompt: str, max_tokens: int = 2000) -> str:
 
 
 def translate_script(script: str, lang: dict, target_words: int) -> str:
+    script_hint = "in Devanagari script" if lang.get("code") == "hi" else ""
     reply = gemini(f"""Translate this YouTube Shorts narration into {lang['name']} ({lang['native_name']}).
 
 Rules:
 - Natural spoken {lang['name']}, the way a narrator would say it, not a literal translation.
+- Write in {lang['name']} standard script ({lang['native_name']}). {script_hint}
 - Keep the same facts, numbers and order. Keep the hook punchy.
 - Aim for about {target_words} words so it takes the same time to say as the English.
 - Write numbers as words where a speaker would say them.

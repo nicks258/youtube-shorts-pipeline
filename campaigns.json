@@ -1,0 +1,54 @@
+[
+  {
+    "name": "Nov 2026 trends",
+    "start_date": "2026-11-20",
+    "end_date": "2026-11-24",
+    "themes": [
+      {
+        "name": "GTA 6 launch",
+        "niche": "gaming",
+        "youtube_category_id": "20",
+        "voice": "bf_alice",
+        "hashtags": [
+          "#GTA6",
+          "#Gaming",
+          "#UnseenFacts"
+        ],
+        "search_queries": [
+          "GTA 6 launch",
+          "GTA 6 sales records",
+          "Grand Theft Auto VI Rockstar"
+        ],
+        "rules": [
+          "Facts and history only: launch numbers, the 13-year gap since GTA V, the two delays, the setting, studio and development history, records.",
+          "NEVER use gameplay footage, trailers, screenshots, cover art, logos or character likenesses. All visuals are our own original pixel-art and HUD scenes, per the Gaming profile in skills/unseen-facts-category-styles.",
+          "No leaks, rumours or review-bombing drama. Only facts reported by named sources."
+        ]
+      },
+      {
+        "name": "Gold price drop",
+        "niche": "finance",
+        "youtube_category_id": "27",
+        "voice": "bm_daniel",
+        "hashtags": [
+          "#Gold",
+          "#Markets",
+          "#UnseenFacts"
+        ],
+        "search_queries": [
+          "gold price drop",
+          "why gold is falling",
+          "gold analysts outlook"
+        ],
+        "rules": [
+          "Explain WHY, with mechanisms: real yields and the opportunity cost of a non-yielding asset, dollar strength, Fed rate expectations, forced selling to meet margin calls, ETF flows, central-bank buying.",
+          "Strictly focus on macroeconomic mechanisms. Exclude retail jewellery demand, jewellery manufacturing warnings, or consumer retail commentary.",
+          "Every number must come from a source published in the last 48 hours and be stated with its date (\"as of 20 November\"). Never a number from memory.",
+          "Forecasts are attributed opinions, never facts: \"Standard Chartered expects...\" not \"gold will fall to...\".",
+          "NO advice: never say buy, sell, hold, wait, or \"now is a good time\". Never imply the narrator is an analyst or advisor.",
+          "Add this to the end of each gold description: \"This is general information, not financial advice.\""
+        ]
+      }
+    ]
+  }
+]

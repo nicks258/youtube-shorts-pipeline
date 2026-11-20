@@ -107,9 +107,25 @@ def get_category_profile(category_name: str | None = None) -> tuple[dict, str]:
     categories = data.get("categories", {})
 
     target = (category_name or os.environ.get("TOPIC_CATEGORY", "") or os.environ.get("TOPIC_NICHE", "")).strip()
-    if target:
+    NICHE_MAP = {
+        "gaming": "Gaming",
+        "finance": "Money",
+        "money": "Money",
+        "tech": "Tech",
+        "science": "Science",
+        "sports": "Sports",
+        "travel": "Travel",
+        "education": "History",
+        "cooking": "Food",
+        "fitness": "Fitness",
+        "entertainment": "Entertainment",
+        "gta 6 launch": "Gaming",
+        "gold price drop": "Money",
+    }
+    canonical = NICHE_MAP.get(target.lower(), target)
+    if canonical:
         for cat_name, prof in categories.items():
-            if cat_name.lower() == target.lower():
+            if cat_name.lower() == canonical.lower():
                 return prof, cat_name
 
     # Fallback to global defaults
@@ -552,42 +568,132 @@ def _validate_scene(s: dict, valid_icons: set[str]) -> dict:
     }
 
 
-def _enforce_variety(scenes: list[dict], valid_icons: set[str]) -> list[dict]:
-    """Ensure max 25% photos and never 3 identical scene types in a row."""
+def _enforce_variety(scenes: list[dict], valid_icons: set[str], cat_name: str = "") -> list[dict]:
+    """Enforce strict visual mix:
+    - 40-50% of scenes must be REAL footage/photos (photo) or AI hero images (hero)
+    - Never more than 2 designed/abstract scenes in a row
+    - Hero scenes capped at 3 max (same image used at most twice)
+    """
     if not scenes:
         return scenes
 
-    # 1. Limit photos to max 25% of scenes
-    max_photos = max(1, len(scenes) // 4)
-    photo_count = 0
-    for s in scenes:
-        if s["type"] == "photo":
-            photo_count += 1
-            if photo_count > max_photos:
-                s["type"] = "icon"
-                s["data"] = {"icons": ["sparkles"], "label": s["data"].get("label") or s["text"]}
+    total = len(scenes)
+    ABSTRACT = {
+        "icon", "big_number", "ui_card", "checklist", "network", "compare",
+        "headlines", "documents", "timeline", "scale_compare", "ranking",
+        "line_chart", "scoreboard", "progress_ring", "archive", "rating",
+        "pixel_title", "poll", "silhouette"
+    }
 
-    # 2. At most MAX_HERO_IMAGES hero scenes (each one is an AI image)
-    hero_count = 0
-    for s in scenes:
-        if s["type"] == "hero":
-            hero_count += 1
-            if hero_count > MAX_HERO_IMAGES:
-                _hero_to_icon(s)
+    # Helper: default search query for photo conversions
+    def default_photo_query(s: dict) -> str:
+        text = s.get("text", "").lower()
+        if cat_name.lower() in ("gaming", "games") or "gta" in text or "game" in text:
+            options = [
+                "hands holding game controller",
+                "people queuing store",
+                "neon city night street",
+                "glowing computer screen dark room",
+                "crowded esports arena hall",
+                "gamer typing setup neon"
+            ]
+            return options[hash(text) % len(options)]
+        elif cat_name.lower() in ("money", "finance") or "gold" in text or "market" in text:
+            options = [
+                "gold bullion vault",
+                "stock market trader screens",
+                "financial district crowd city",
+                "bank vault safe door",
+                "currency cash counting"
+            ]
+            return options[hash(text) % len(options)]
+        else:
+            w = [word for word in re.findall(r'[a-z]+', text) if len(word) > 3 and word not in STOPWORDS]
+            return " ".join(w[:2]) if w else "modern city"
 
-    # 3. Never same type 3 times in a row
-    for i in range(2, len(scenes)):
-        if scenes[i]["type"] == scenes[i-1]["type"] == scenes[i-2]["type"]:
-            prev_type = scenes[i]["type"]
-            if prev_type == "hero":
-                _hero_to_icon(scenes[i])
-                continue
-            alt_type = "silhouette" if prev_type == "icon" else "icon"
-            scenes[i]["type"] = alt_type
-            if alt_type == "icon":
-                scenes[i]["data"] = {"icons": ["sparkles"], "label": scenes[i]["data"].get("label") or scenes[i]["text"]}
-            else:
-                scenes[i]["data"] = {"label": scenes[i]["data"].get("label") or scenes[i]["text"]}
+    # 1. Scene 1 MUST be hero
+    if scenes[0]["type"] != "hero":
+        scenes[0]["type"] = "hero"
+        scenes[0]["data"] = {
+            "moment": "full view of the subject",
+            "label": "",
+            "callouts": [],
+            "icons": scenes[0]["data"].get("icons") or ["sparkles"]
+        }
+
+    # 2. Hero count cap (max 3)
+    hero_indices = [i for i, s in enumerate(scenes) if s["type"] == "hero"]
+    if len(hero_indices) > 3:
+        for idx in hero_indices[3:]:
+            scenes[idx]["type"] = "photo"
+            scenes[idx]["data"] = {
+                "query": scenes[idx]["data"].get("query") or default_photo_query(scenes[idx]),
+                "label": scenes[idx]["data"].get("label") or ""
+            }
+
+    # 3. Never more than 2 designed/abstract scenes in a row
+    for i in range(len(scenes)):
+        if scenes[i]["type"] in ABSTRACT:
+            streak = 1
+            j = i - 1
+            while j >= 0 and scenes[j]["type"] in ABSTRACT:
+                streak += 1
+                j -= 1
+            if streak >= 3:
+                scenes[i]["type"] = "photo"
+                scenes[i]["data"] = {
+                    "query": scenes[i]["data"].get("query") or default_photo_query(scenes[i]),
+                    "label": scenes[i]["data"].get("label") or ""
+                }
+
+    # 4. Enforce 40-50% visual scenes (photo or hero)
+    import math
+    target_min = math.ceil(total * 0.40)
+    target_max = round(total * 0.50)
+
+    visual_indices = [i for i, s in enumerate(scenes) if s["type"] in ("hero", "photo")]
+    while len(visual_indices) < target_min:
+        candidates = [
+            i for i, s in enumerate(scenes)
+            if s["type"] in ABSTRACT and s["type"] not in ("poll",) and i > 0
+        ]
+        if not candidates:
+            break
+        best_cand = max(candidates, key=lambda idx: (
+            (1 if idx > 0 and scenes[idx-1]["type"] in ABSTRACT else 0) +
+            (1 if idx < total - 1 and scenes[idx+1]["type"] in ABSTRACT else 0)
+        ))
+        scenes[best_cand]["type"] = "photo"
+        scenes[best_cand]["data"] = {
+            "query": scenes[best_cand]["data"].get("query") or default_photo_query(scenes[best_cand]),
+            "label": scenes[best_cand]["data"].get("label") or ""
+        }
+        visual_indices = [i for i, s in enumerate(scenes) if s["type"] in ("hero", "photo")]
+
+    while len(visual_indices) > target_max:
+        photo_candidates = [i for i, s in enumerate(scenes) if s["type"] == "photo"]
+        if not photo_candidates:
+            break
+        chosen = None
+        for cand in reversed(photo_candidates):
+            left_abstract = 0
+            j = cand - 1
+            while j >= 0 and scenes[j]["type"] in ABSTRACT:
+                left_abstract += 1
+                j -= 1
+            right_abstract = 0
+            j = cand + 1
+            while j < total and scenes[j]["type"] in ABSTRACT:
+                right_abstract += 1
+                j += 1
+            if left_abstract + 1 + right_abstract <= 2:
+                chosen = cand
+                break
+        if chosen is None:
+            break
+        scenes[chosen]["type"] = "icon"
+        scenes[chosen]["data"] = {"icons": ["sparkles"], "label": scenes[chosen]["data"].get("label") or scenes[chosen]["text"]}
+        visual_indices = [i for i, s in enumerate(scenes) if s["type"] in ("hero", "photo")]
 
     return scenes
 
@@ -724,6 +830,7 @@ or clause), never more than 9 words in one scene.
 Every single word of the narration must be included across the scenes in order with NO omissions and NO gaps.
 
 Scene Types (prioritize PREFERRED SCENE TYPES above):
+- photo: {{"query": "search query for real stock footage/photos", "label": "optional short label"}} -> Real footage or photography.
 - hero: {{"moment": "what the subject is doing/showing in THIS scene", "label": "optional kicker", "callouts": ["up to 3", "short chips"], "icons": ["fallback lucide icon"]}}
   -> A large image of the main subject. Use it for every line ABOUT the subject (what it is, looks like, does).
 - big_number: {{"value": "40%", "label": "short label"}} -> Years, prices, percentages, counts. (MUST contain digits).
@@ -752,7 +859,28 @@ Scene Types (prioritize PREFERRED SCENE TYPES above):
 
 Rules:
 1. Scene 1 MUST be a hero scene showing the subject clearly (full view).
-2. About HALF of all scenes are hero scenes (max 6). Use non-hero scenes ONLY for abstract ideas, numbers, and comparisons - never for the subject itself.
+2. VISUAL MIX & FOOTAGE SEARCH TERMS (MANDATORY):
+   - 40% to 50% of all scenes MUST be REAL footage/photos ("photo") or AI hero images ("hero").
+   - NEVER place more than 2 designed/abstract scenes (icon, big_number, ui_card, checklist, network, compare) in a row.
+   - Use 2-3 hero scenes in total. (The same hero image may be used at most twice, and the second time must use a different framing: closeup, pan, or wide).
+   - The remaining visual scenes (3 to 5 scenes) MUST be "photo" scenes using real stock footage/photos.
+   - For every "photo" scene, provide data.query with specific 2-4 word stock search terms.
+   - For topics where the subject itself cannot be filmed or shown (video games, unreleased movies, tech brands):
+     Search for the HUMAN SIDE instead:
+     * "people queuing store"
+     * "hands holding game controller"
+     * "glowing television dark room"
+     * "neon city streets night"
+     * "crowded esports arena hall"
+     * "hands typing keyboard setup"
+     NEVER search for gameplay, trailers, logos, box art, or recognisable faces.
+   - For Finance/Gold:
+     * "gold bullion vault"
+     * "stock trader computer screen"
+     * "financial district crowd"
+     * "currency counting banknotes"
+     * "trading floor screens"
+     * "bank vault door"
 3. Labels, callouts and titles must ADD information the viewer is not hearing at that moment (a name, a number,
    a place, a fact from the script). NEVER repeat the words spoken in that scene - the captions already show them.
    Leave "label" empty rather than repeating the narration.
@@ -792,7 +920,7 @@ Respond with ONLY raw JSON:
         first["data"] = {"moment": "full view of the subject", "label": "", "callouts": [],
                          "icons": first["data"].get("icons") or ["sparkles"], **({"stamp": first["data"]["stamp"]} if first["data"].get("stamp") else {})}
         first["type"] = "hero"
-    scenes = _enforce_variety(validated, valid_icons)
+    scenes = _enforce_variety(validated, valid_icons, cat_name=cat_name)
     _drop_redundant_labels(scenes, script)
 
     heroes = sum(s["type"] == "hero" for s in scenes)
@@ -815,7 +943,7 @@ Respond with ONLY raw JSON:
         _resolve_hero_scenes(scenes, subject, meta, out_dir, hero_style=hero_style, image_rules=image_rules)
 
     if any(s["type"] == "photo" for s in scenes):
-        _resolve_photo_scenes(scenes, out_dir)
+        _resolve_photo_scenes(scenes, out_dir, accent=accent, cat_name=cat_name)
 
     if out_dir:
         (Path(out_dir) / "story_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -975,8 +1103,7 @@ def _image_shows(path: Path, description: str) -> bool | None:
     """Ask Gemini Flash Lite whether the image shows `description`. None = check unavailable."""
     data = path.read_bytes()
     mime = "image/png" if data[:4] == b"\x89PNG" else "image/webp" if data[8:12] == b"WEBP" else "image/jpeg"
-    question = (f"Does this image clearly show {description}, with correct anatomy and no text, "
-                "no doubled outlines, ghosting, smeared or blurry edges, and no extra or missing body parts? "
+    question = (f"Does this image reasonably depict {description}, without extra limbs, mangled anatomy, or prominent unwanted text? "
                 "Reply YES or NO.")
     parts = [{"text": question}, {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}]
     # Ask the SAME model for every image of the run. gemini_model drops a model for the
@@ -1079,30 +1206,40 @@ def _resolve_hero_scenes(scenes: list[dict], subject: str, meta: dict, out_dir: 
 
     approved = [i for i, s in enumerate(scenes) if s["type"] == "hero" and s["data"].get("image")]
     hero_order = [i for i, s in enumerate(scenes) if s["type"] == "hero"]
+    image_usage = {scenes[i]["data"]["image"]: 1 for i in approved}
+
     for i in failed:
         if not approved:
             _hero_to_icon(scenes[i])
             continue
-        src = _pick_reuse_source(i, hero_order, approved)
-        scenes[i]["data"]["image"] = scenes[src]["data"]["image"]
+        # Only reuse approved images that have been used < 2 times
+        available = [src for src in approved if image_usage.get(scenes[src]["data"]["image"], 0) < 2]
+        if not available:
+            # Cannot use any hero image more than twice -> convert to photo scene
+            scenes[i]["type"] = "photo"
+            scenes[i]["data"] = {
+                "query": scenes[i]["data"].get("query") or (scenes[i]["data"].get("moment") or scenes[i]["text"]),
+                "label": scenes[i]["data"].get("label") or ""
+            }
+            continue
+        src = _pick_reuse_source(i, hero_order, available)
+        img_path = scenes[src]["data"]["image"]
+        scenes[i]["data"]["image"] = img_path
         scenes[i]["data"]["reused_from"] = src
+        image_usage[img_path] = image_usage.get(img_path, 0) + 1
 
     # framings, in order: new images use the default slow push-in; a reused one takes
-    # the next framing that differs from the hero scene right before it
-    prev, k = None, 0
+    # closeup, pan, or wide (never push)
+    framing_pool = ("closeup", "pan", "wide")
+    reused_idx = 0
     for s in scenes:
         if s["type"] != "hero":
             continue
         if "reused_from" in s["data"]:
-            for _ in range(len(REUSE_FRAMINGS)):
-                f = REUSE_FRAMINGS[k % len(REUSE_FRAMINGS)]
-                k += 1
-                if f != prev:
-                    break
-            s["data"]["framing"] = f
+            s["data"]["framing"] = framing_pool[reused_idx % len(framing_pool)]
+            reused_idx += 1
         else:
             s["data"]["framing"] = "push"
-        prev = s["data"]["framing"]
 
     new = len(approved)
     reused = sum(1 for s in scenes if s["type"] == "hero" and "reused_from" in s["data"])
@@ -1113,8 +1250,8 @@ def _resolve_hero_scenes(scenes: list[dict], subject: str, meta: dict, out_dir: 
         f"{reused} reused with a new framing, {icons} icons")
 
 
-def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None):
-    """Download and treat photos for any photo scenes using Pixabay + Gemini check."""
+def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str = "#FFD666", cat_name: str = ""):
+    """Download and treat photos for any photo scenes using Pixabay + category restyling."""
     tpl = get_story_template_dir()
     media_dir = tpl / "assets" / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -1136,50 +1273,97 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None):
     for i, s in enumerate(scenes):
         if s["type"] != "photo":
             continue
-        query = s.get("photo_query") or s["data"].get("label") or s["text"]
+        raw_query = s["data"].get("query") or s.get("photo_query") or s["data"].get("label") or s["text"]
+
+        # Clean and target queries, enforcing human side for gaming / unfilmed subjects
+        query = str(raw_query).strip()
+        if cat_name.lower() in ("gaming", "games") or "gta" in query.lower() or "game" in query.lower():
+            cleaned = re.sub(r'\b(gta|rockstar|grand theft auto|gameplay|trailer)\b', '', query, flags=re.I).strip()
+            if not cleaned or len(cleaned.split()) < 2:
+                human_queries = [
+                    "hands holding game controller",
+                    "people queuing store",
+                    "neon city night street",
+                    "glowing television dark room",
+                    "crowded esports arena hall",
+                    "gamer typing keyboard neon"
+                ]
+                query = human_queries[i % len(human_queries)]
+            else:
+                query = cleaned
+        elif cat_name.lower() in ("money", "finance") or "gold" in query.lower():
+            cleaned = re.sub(r'\b(unlikely|jewellery|jewelry|warn|warning)\b', '', query, flags=re.I).strip()
+            if not cleaned or len(cleaned.split()) < 1:
+                finance_queries = [
+                    "gold bullion vault",
+                    "stock trader computer screen",
+                    "financial district crowd",
+                    "bank vault safe door",
+                    "currency counting banknotes"
+                ]
+                query = finance_queries[i % len(finance_queries)]
+            else:
+                query = cleaned
+
         out_jpg = media_dir / f"photo_scene_{i:02d}_{int(time.time())}.jpg"
         rel_path = f"assets/media/{out_jpg.name}"
 
         success = False
         if source and source[1]:  # has API key
-            source_name, key, _, search_photos = source
+            source_name, key, search_videos, search_photos = source
             try:
                 candidates = search_photos(query, key)
+                if not candidates:
+                    candidates = search_videos(query, key)
+                if not candidates:
+                    fallback_q = "neon city night" if "gaming" in cat_name.lower() else "gold bullion"
+                    candidates = search_photos(fallback_q, key)
+
                 chosen = None
                 if candidates:
-                    try:
-                        from .stock_visuals import _pick_with_vision
-                        chosen = _pick_with_vision(s["text"], query, candidates[:4])
-                    except Exception:
-                        chosen = candidates[0]
+                    unused = [c for c in candidates if c.get("id") not in used_photos]
+                    chosen = unused[0] if unused else candidates[0]
+                    used_photos.add(chosen.get("id"))
+
                 if chosen:
                     raw_tmp = (out_dir or Path("/tmp")) / f"raw_photo_{i}.jpg"
                     stock_visuals._download(chosen["url"], raw_tmp)
                     if treat_script.exists():
-                        subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg)],
+                        subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
                                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     else:
-                        _ffmpeg_duotone(raw_tmp, out_jpg)
+                        _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
                     if out_jpg.exists() and out_jpg.stat().st_size > 0:
                         s["data"]["path"] = rel_path
+                        if out_dir:
+                            shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
                         success = True
             except Exception as e:
                 log(f"Photo scene {i} sourcing failed ({e})")
 
         if not success:
-            # Fallback: check if test_hall.jpg exists or convert scene to safe icon
-            if (media_dir / "test_hall.jpg").exists():
-                s["data"]["path"] = "assets/media/test_hall.jpg"
-            else:
-                s["type"] = "icon"
-                s["data"] = {"icons": ["sparkles"], "label": s["data"].get("label") or s["text"]}
+            _hero_to_icon(s)
 
 
-def _ffmpeg_duotone(src: Path, dest: Path):
-    """Fallback duotone filter if treat_photo.sh is missing."""
-    vf = ("scale=1080:1110:force_original_aspect_ratio=increase,crop=1080:1110,"
-          "format=gray,eq=contrast=1.25:brightness=-0.06:gamma=0.9,format=rgb24,"
-          "lutrgb=r='val*1.0':g='val*0.84':b='val*0.40'")
+def _ffmpeg_duotone(src: Path, dest: Path, accent: str = "#FFD666"):
+    """Restyle photo/video still: duotone toward accent, glow, grain, vignette."""
+    hex_code = str(accent or "#FFD666").lstrip("#")
+    if len(hex_code) == 6:
+        r_norm = int(hex_code[0:2], 16) / 255.0
+        g_norm = int(hex_code[2:4], 16) / 255.0
+        b_norm = int(hex_code[4:6], 16) / 255.0
+    else:
+        r_norm, g_norm, b_norm = 1.0, 0.84, 0.40
+
+    vf = (
+        f"scale=1080:1110:force_original_aspect_ratio=increase,crop=1080:1110,"
+        f"format=gray,eq=contrast=1.25:brightness=-0.05:gamma=0.95,format=rgb24,"
+        f"lutrgb=r='val*{r_norm:.3f}':g='val*{g_norm:.3f}':b='val*{b_norm:.3f}',"
+        f"split=2[base][blur];[blur]boxblur=12:1[glow];[base][glow]blend=all_mode=screen:all_opacity=0.3[tinted];"
+        f"[tinted]vignette=PI/3.5,noise=c0s=10:c0f=u"
+    )
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-frames:v", "1",
+                    "-vf", vf, "-q:v", "3", str(dest)], check=True)
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-frames:v", "1",
                     "-vf", vf, "-q:v", "3", str(dest)], check=True)
 

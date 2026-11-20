@@ -118,6 +118,11 @@ def cmd_produce(args):
             provider=tts_provider,
             voice_config=voice_config,
         )
+        from .assemble import get_audio_duration
+        vo_duration = get_audio_duration(vo_path)
+        log(f"Voiceover duration: {vo_duration:.1f}s")
+        if vo_duration > 45.0:
+            raise RuntimeError(f"Voiceover duration {vo_duration:.1f}s exceeds hard cap of 45.0s!")
         state.complete_stage("voiceover", {"path": str(vo_path)})
     else:
         log("Skipping voiceover (already done)")

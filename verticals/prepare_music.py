@@ -35,11 +35,27 @@ def get_music_mood_for_category(category: str | None) -> str:
     cat_path = find_categories_json()
     if not cat_path:
         return ""
+    NICHE_MAP = {
+        "gaming": "Gaming",
+        "finance": "Money",
+        "money": "Money",
+        "tech": "Tech",
+        "science": "Science",
+        "sports": "Sports",
+        "travel": "Travel",
+        "education": "History",
+        "cooking": "Food",
+        "fitness": "Fitness",
+        "entertainment": "Entertainment",
+        "gta 6 launch": "Gaming",
+        "gold price drop": "Money",
+    }
+    canonical = NICHE_MAP.get(category.strip().lower(), category.strip())
     try:
         data = json.loads(cat_path.read_text(encoding="utf-8"))
         categories = data.get("categories", {})
         for name, prof in categories.items():
-            if name.lower() == category.strip().lower():
+            if name.lower() == canonical.lower():
                 return prof.get("music_mood", "")
     except Exception as e:
         print(f"  [music] Warning loading categories.json: {e}", file=sys.stderr)

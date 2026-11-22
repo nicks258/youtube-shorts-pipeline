@@ -193,6 +193,72 @@ def _validate_campaign_script(script: str, theme: dict, sources: list[dict], dra
     return True, "Valid"
 
 
+def _mark_topic_used(topic: str):
+    """Mark a topic as used in used_topics.txt so the picker skips it."""
+    import pathlib
+    candidates = [
+        pathlib.Path("history/used_topics.txt"),
+        pathlib.Path("my-shorts-bot/history/used_topics.txt"),
+        pathlib.Path(__file__).resolve().parent.parent / "my-shorts-bot" / "history" / "used_topics.txt",
+    ]
+    for c in candidates:
+        if c.parent.exists():
+            try:
+                with open(c, "a", encoding="utf-8") as f:
+                    f.write(topic.strip() + "\n")
+            except Exception:
+                pass
+
+
+# ── Confusion Self-Check ─────────────────────────────────────────────────────
+
+def _check_confusion(script: str) -> dict:
+    """Ask Gemini Flash Lite if someone who has never heard of this topic can follow the script."""
+    script_str = str(script or "").strip()
+    if not script_str:
+        return {"followable": False, "first_confusing_sentence": "Script is empty", "reason": "No script provided"}
+    prompt = f"""You are checking a 40-second faceless YouTube Shorts script for clarity to a general audience.
+The viewer has NEVER heard of this topic, show, place, or event before.
+
+SCRIPT:
+\"\"\"{script_str}\"\"\"
+
+Could someone who has never heard of this topic follow this script? Which sentence first confuses them?
+Evaluate strictly:
+1. Did the script explicitly name the actual subject (the show, place, company, person, product) in the first two sentences?
+2. Did it immediately define any proper nouns, unfamiliar jargon, or format rules in one clause?
+3. Did it explain who/what/where before explaining why it matters?
+4. Did it avoid vague subjects like 'this twist', 'the show', or 'this landmark'?
+
+Respond in this exact JSON format:
+{{
+  "followable": true or false,
+  "first_confusing_sentence": "exact sentence from script, or None",
+  "reason": "concise explanation of why someone would be confused or what context is missing"
+}}
+"""
+    try:
+        try:
+            from .gemini_model import generate
+        except Exception:
+            from gemini_model import generate
+        raw = generate([{"text": prompt}], max_tokens=600, temperature=0.1, kind="vision")
+        m = re.search(r"```(?:json)?\s*(.*?)```", raw, re.S)
+        text = m.group(1).strip() if m else raw.strip()
+        s, e = text.find("{"), text.rfind("}") + 1
+        if s >= 0 and e > s:
+            text = text[s:e]
+        data = json.loads(text)
+        return {
+            "followable": bool(data.get("followable", True)),
+            "first_confusing_sentence": str(data.get("first_confusing_sentence") or "None"),
+            "reason": str(data.get("reason") or "")
+        }
+    except Exception as e:
+        log(f"Confusion check skipped or failed ({e})")
+        return {"followable": True, "first_confusing_sentence": "None", "reason": f"Check skipped ({e})"}
+
+
 # ── Main Generator ───────────────────────────────────────────────────────────
 
 def generate_draft(
@@ -296,13 +362,20 @@ RULES:
 - Anti-hallucination: only use names, scores, events found in research and verified sources above
 - Follow the TONE, PACING, and HOOK PATTERNS from the niche profile above
 - Pick the most appropriate hook pattern for this specific topic
-- Use one of the CTA OPTIONS at the end
+- Do NOT use generic CTA phrases (like "What do you think? Comment below" or "Subscribe for more"); instead end with a SPECIFIC, thought-provoking question about this exact topic
 - Never use any of the NEVER USE phrases
 - B-roll prompts must follow the visual guidance (style, mood, preferred subjects)
 - Never mention the video's length or use the word "seconds" about the video (no "in 60 seconds")
 - No filler such as "let me break down", "in this video", "let's dive in" or "here's why"
 - Go straight from the hook to the facts: the second sentence must already be a concrete fact
 - Never promise or mention a Part 2, a follow-up video or a series
+
+SELF-CONTAINED SCRIPT RULES (MANDATORY FOR ALL VIDEOS):
+- Name the actual subject explicitly in the first two sentences (the show, place, company, person, product - by specific name). The hook MUST name the subject directly (e.g. "Survivor just broke its own biggest rule" is accepted; "This game-changing twist" is REJECTED).
+- Immediately define any proper noun, jargon, or format a general viewer wouldn't know, in one clear clause.
+- Answer who/what/where before why it matters.
+- NEVER use vague placeholders like "this twist", "the show", "this landmark", "this animal", "this company" as the subject without naming it.
+- End with a SPECIFIC, thought-provoking question about this exact topic, never a reused generic line. Vary it every video.
 
 {_get_category_script_guidance(niche)}
 
@@ -334,6 +407,86 @@ Output JSON exactly:
         raw = raw[start:end]
 
     draft = _guard_draft(raw, lambda: _llm_fn(prompt))
+
+    # ── Quality Reviews (Gemini self-check + Ant Ling reviewer) ───────────────
+    try:
+        from .reviewer import review_script
+    except Exception:
+        try:
+            from reviewer import review_script
+        except Exception:
+            review_script = None
+
+    check = _check_confusion(draft.get("script", ""))
+    draft["confusion_check"] = check
+
+    review_verdict = None
+    if review_script:
+        try:
+            review_verdict = review_script(draft.get("script", ""), news, sources=sources)
+            draft["review_verdict"] = review_verdict
+        except Exception as e:
+            log(f"Script reviewer failed ({e}) -- continuing")
+
+    needs_regen = (
+        (check and not check.get("followable", True)) or
+        (review_verdict and not review_verdict.get("pass", True))
+    )
+
+    if needs_regen:
+        reasons = []
+        if check and not check.get("followable", True):
+            reasons.append(f"Clarity check: {check.get('reason')} (Sentence: '{check.get('first_confusing_sentence')}')")
+        if review_verdict and not review_verdict.get("pass", True):
+            probs = ", ".join(review_verdict.get("problems", []))
+            reasons.append(f"Reviewer problems: {probs}")
+            if review_verdict.get("worst_sentence"):
+                reasons.append(f"Worst sentence: '{review_verdict.get('worst_sentence')}'")
+            if review_verdict.get("fix_suggestion"):
+                reasons.append(f"Fix suggestion: {review_verdict.get('fix_suggestion')}")
+
+        reasons_text = "\n".join(f"- {r}" for r in reasons)
+        log(f"Script flagged by quality checks. Regenerating once with feedback:\n{reasons_text}")
+
+        regen_prompt = prompt + f"""
+
+IMPORTANT CORRECTION REQUIRED:
+Your previous draft FAILED quality review for the following reasons:
+{reasons_text}
+
+Rewrite the script to be completely self-contained and fix all issues:
+- Name the actual subject by specific name in the first two sentences.
+- The hook MUST name the subject directly.
+- Define proper nouns or format rules immediately in one clause.
+- Ensure a viewer who has never heard of this topic can follow it effortlessly.
+- Verify every number appears in the sources.
+- End with a SPECIFIC, varied question about this exact topic (never a reused generic line).
+"""
+        try:
+            raw_retry = _llm_fn(regen_prompt)
+            if raw_retry.startswith("```"):
+                raw_retry = raw_retry.split("```")[1]
+                if raw_retry.startswith("json"):
+                    raw_retry = raw_retry[4:]
+                raw_retry = raw_retry.strip()
+            start_r = raw_retry.find("{")
+            end_r = raw_retry.rfind("}") + 1
+            if start_r >= 0 and end_r > start_r:
+                raw_retry = raw_retry[start_r:end_r]
+            draft_retry = _guard_draft(raw_retry, lambda: _llm_fn(regen_prompt))
+            check_retry = _check_confusion(draft_retry.get("script", ""))
+            draft_retry["confusion_check"] = check_retry
+            if review_script:
+                verdict_retry = review_script(draft_retry.get("script", ""), news, sources=sources)
+                draft_retry["review_verdict"] = verdict_retry
+                if not verdict_retry.get("pass", True):
+                    log(f"Regenerated script FAILED review twice: {verdict_retry.get('problems')}. Skipping topic.")
+                    _mark_topic_used(news)
+                    draft_retry["failed_review_twice"] = True
+                    draft_retry["skip_topic"] = True
+            draft = draft_retry
+        except Exception as e:
+            log(f"Script regeneration failed ({e}), keeping initial draft")
 
     # Campaign validation & rejection guard
     if theme:

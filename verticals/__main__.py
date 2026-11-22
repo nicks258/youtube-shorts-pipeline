@@ -222,6 +222,10 @@ def cmd_upload(args):
         print(f"  No produced video found for lang={lang}. Run produce first.")
         sys.exit(1)
 
+    if draft.get("frame_review") and not draft["frame_review"].get("pass", True):
+        log("Upload skipped: frame review failed. Video preserved as draft artifact.")
+        return None
+
     # Thumbnail
     thumb_path = None
     if force or not state.is_done("thumbnail"):
@@ -249,8 +253,50 @@ def cmd_upload(args):
     return url
 
 
+def _extract_sample_frames(video_path: Path, num_frames: int = 6) -> list[Path]:
+    """Sample frames from video, ensuring frame 1 is within first 2 seconds and others evenly spaced."""
+    import subprocess
+    work_dir = video_path.parent / "review_frames"
+    work_dir.mkdir(exist_ok=True)
+    duration = 40.0
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        duration = float(res.stdout.strip())
+    except Exception:
+        pass
+
+    frames = []
+    timestamps = [1.0]  # Frame 1 at 1.0s to check subject visibility in first 2 seconds
+    step = max(1.0, (duration - 2.0) / max(1, num_frames - 1))
+    for i in range(1, num_frames):
+        timestamps.append(round(min(duration - 0.5, 2.0 + step * (i - 0.5)), 2))
+
+    for idx, ts in enumerate(timestamps):
+        out_jpg = work_dir / f"frame_{idx + 1}_{ts}s.jpg"
+        cmd = [
+            "ffmpeg", "-y", "-ss", str(ts), "-i", str(video_path),
+            "-vframes", "1", "-q:v", "3", str(out_jpg)
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if out_jpg.exists() and out_jpg.stat().st_size > 0:
+            frames.append(out_jpg)
+    return frames
+
+
 def cmd_run(args):
     draft_path = cmd_draft(args)
+    if not draft_path or not Path(draft_path).exists():
+        return
+    import json
+    draft = json.loads(Path(draft_path).read_text(encoding="utf-8"))
+    if draft.get("skip_topic") or draft.get("failed_review_twice"):
+        print("\n  [QUALITY AUDIT]: Topic failed review twice. Skipping production/upload.")
+        return
+
     if args.dry_run:
         print("  Dry run — skipping produce + upload")
         return
@@ -263,6 +309,21 @@ def cmd_run(args):
         voice = getattr(args, "voice", None)
 
     video_path = cmd_produce(ProduceArgs())
+
+    # Frame review after render, before upload (Ling-3.2-flash)
+    try:
+        from .reviewer import review_frames
+        sample_frames = _extract_sample_frames(Path(video_path), num_frames=6)
+        if sample_frames:
+            f_verdict = review_frames(sample_frames, draft.get("script", ""), draft.get("news", ""))
+            draft["frame_review"] = f_verdict
+            Path(draft_path).write_text(json.dumps(draft, indent=2, ensure_ascii=False), encoding="utf-8")
+            if not f_verdict.get("pass", True):
+                print(f"\n  [FRAME REVIEW FAILED]: {f_verdict.get('problems')}")
+                print(f"  Keeping video as draft artifact ({video_path}); skipping upload.\n")
+                return
+    except Exception as e:
+        log(f"Frame review step encountered error ({e}) -- proceeding safely")
 
     class UploadArgs:
         draft = str(draft_path)

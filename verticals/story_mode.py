@@ -37,6 +37,27 @@ except (ImportError, ValueError):
             return os.environ.get("GEMINI_API_KEY", "")
         MEDIA_DIR = Path.home() / ".verticals" / "media"
 
+STOPWORDS = {
+    "about", "above", "after", "again", "against", "all", "and", "any", "are", "aren't",
+    "because", "been", "before", "being", "below", "between", "both", "but", "by", "can",
+    "cannot", "could", "couldn't", "did", "didn't", "does", "doesn't", "doing", "don't",
+    "down", "during", "each", "few", "for", "from", "further", "had", "hadn't", "has",
+    "hasn't", "have", "haven't", "having", "here", "how", "into", "itself", "just", "more",
+    "most", "other", "some", "such", "than", "that", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "these", "they", "this", "those", "through", "under",
+    "until", "very", "what", "when", "where", "which", "while", "who", "whom", "why", "with"
+}
+
+try:
+    from .real_photos import fetch_real_subject_photo, burn_credit_line, search_real_photo_candidates
+except Exception:
+    try:
+        from real_photos import fetch_real_subject_photo, burn_credit_line, search_real_photo_candidates
+    except Exception:
+        fetch_real_subject_photo = None
+        burn_credit_line = None
+        search_real_photo_candidates = None
+
 
 VALID_SCENE_TYPES = {
     "big_number", "icon", "silhouette", "ui_card", "headlines",
@@ -611,8 +632,8 @@ def _enforce_variety(scenes: list[dict], valid_icons: set[str], cat_name: str = 
             w = [word for word in re.findall(r'[a-z]+', text) if len(word) > 3 and word not in STOPWORDS]
             return " ".join(w[:2]) if w else "modern city"
 
-    # 1. Scene 1 MUST be hero
-    if scenes[0]["type"] != "hero":
+    # 1. Scene 1 must show the real subject (photo) if one exists, otherwise hero
+    if scenes[0]["type"] not in ("hero", "photo"):
         scenes[0]["type"] = "hero"
         scenes[0]["data"] = {
             "moment": "full view of the subject",
@@ -823,6 +844,9 @@ STEP 1 - SUBJECT. Write ONE "subject" description: what the main subject of this
 description an illustrator could draw (species/object, colour, size, distinctive features), 8-25 words.
 Example: "a tiny olive-green baby sea turtle hatchling with two fully formed heads on one shell".
 It is reused word for word for every hero image, so describe only the subject itself (no setting, no action).
+Also determine:
+- "is_real_thing": true if the subject is a REAL named physical entity (a specific physical place, building, structure, living animal/plant species, physical artifact, or real historical event that physically exists in the real world). False for abstract game mechanics, format rules, digital concepts, fictional stories, or unfilmed entities.
+- "real_subject_name": The specific real-world name of this physical entity (e.g. "Wallis Annenberg Wildlife Crossing"), or null if not a real physical entity.
 
 STEP 2 - SCENES. Split the SCRIPT into consecutive scenes of 5-8 words each (about {seconds_per_visual} seconds of speech).
 The visual must change every {seconds_per_visual} seconds: split long sentences into several scenes (a new scene at a comma
@@ -898,6 +922,8 @@ Rules:
 Respond with ONLY raw JSON:
 {{
   "subject": "visual description of the main subject",
+  "is_real_thing": true,
+  "real_subject_name": "exact real-world name or null",
   "series": false,
   "scenes": [
     {{"text": "exact words spoken in this scene", "type": "hero | big_number | icon | ...", "data": {{ ... }}}}
@@ -909,13 +935,116 @@ Respond with ONLY raw JSON:
     parsed = _parse_plan(raw)
     subject = _clean_text(parsed.get("subject") or title or "the main subject", 160)
     series = parsed.get("series") is True
+    is_real_thing = parsed.get("is_real_thing") is True
+    real_subject_name = str(parsed.get("real_subject_name") or "").strip()
+
+    # Heuristic check for physical places, structures, animals, landmarks
+    combined_check = (title + " " + script + " " + subject).lower()
+    if not is_real_thing:
+        for kw in ("crossing", "bridge", "animal", "sanctuary", "building", "mountain", "species", "telescope", "rover", "station", "monument"):
+            if kw in combined_check:
+                is_real_thing = True
+                break
+    if not real_subject_name and is_real_thing:
+        # Extract potential proper name
+        m_name = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})\b', title)
+        real_subject_name = m_name.group(1) if m_name else subject
+
     raw_scenes = parsed.get("scenes") or []
     if not isinstance(raw_scenes, list) or not raw_scenes:
         raise ValueError("Parsed scenes list is empty")
 
     validated = [_validate_scene(s, valid_icons) for s in raw_scenes]
-    # Rule: scene 1 is always a hero image of the subject.
-    if validated[0]["type"] != "hero":
+
+    # Resolve Scene 1 for real subjects:
+    # Priority order: openverse/commons photo -> Pixabay footage -> AI hero image -> icon scene
+    scene1_real_photo = None
+    if is_real_thing and fetch_real_subject_photo:
+        query_candidates = [q for q in [real_subject_name, subject, title] if q and len(q) > 3]
+        media_dir = get_story_template_dir() / "assets" / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        treat_script = get_story_template_dir() / "tools" / "treat_photo.sh"
+        raw_tmp = (out_dir or Path("/tmp")) / f"real_subject_scene0_{int(time.time())}.jpg"
+        out_jpg = media_dir / f"photo_scene_00_{int(time.time())}.jpg"
+
+        for q in query_candidates:
+            cand = fetch_real_subject_photo(q, raw_tmp)
+            if cand and raw_tmp.exists():
+                try:
+                    if treat_script.exists():
+                        subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
+                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
+                    if burn_credit_line:
+                        burn_credit_line(out_jpg, cand["credit"])
+                    if out_jpg.exists() and out_jpg.stat().st_size > 0:
+                        rel_path = f"assets/media/{out_jpg.name}"
+                        validated[0]["type"] = "photo"
+                        validated[0]["data"] = {
+                            "path": rel_path,
+                            "query": q,
+                            "credit": cand["credit"],
+                            "creator": cand["creator"],
+                            "license": cand["license"],
+                            "source": cand["source"],
+                            "title": cand["title"],
+                            "is_real_subject": True
+                        }
+                        if out_dir:
+                            shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
+                        scene1_real_photo = cand
+                        log(f"Scene 1 resolved with real {cand['source']} photo: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
+                        break
+                except Exception as e:
+                    log(f"Restyling real subject photo failed: {e}")
+
+        # Fallback to Pixabay footage if Openverse/Commons returned nothing
+        if not scene1_real_photo:
+            try:
+                try:
+                    from . import stock_visuals
+                    source = stock_visuals._stock_source()
+                except Exception:
+                    import stock_visuals
+                    source = stock_visuals._stock_source()
+                if source and source[1]:
+                    _, key, search_videos, search_photos = source
+                    for q in query_candidates[:2]:
+                        cands = search_photos(q, key) or search_videos(q, key)
+                        if cands:
+                            stock_visuals._download(cands[0]["url"], raw_tmp)
+                            if treat_script.exists():
+                                subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
+                                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            else:
+                                _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
+                            credit_str = f"Stock: Pixabay ({cands[0].get('user', 'Pixabay')})"
+                            if burn_credit_line:
+                                burn_credit_line(out_jpg, credit_str)
+                            if out_jpg.exists() and out_jpg.stat().st_size > 0:
+                                rel_path = f"assets/media/{out_jpg.name}"
+                                validated[0]["type"] = "photo"
+                                validated[0]["data"] = {
+                                    "path": rel_path,
+                                    "query": q,
+                                    "credit": credit_str,
+                                    "creator": cands[0].get("user", "Pixabay"),
+                                    "license": "Pixabay Free",
+                                    "source": "pixabay",
+                                    "title": q,
+                                    "is_real_subject": True
+                                }
+                                if out_dir:
+                                    shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
+                                scene1_real_photo = {"source": "pixabay", "credit": credit_str, "creator": cands[0].get("user", "Pixabay"), "license": "Pixabay Free"}
+                                log("Scene 1 resolved with real Pixabay footage/photo")
+                                break
+            except Exception as e:
+                log(f"Pixabay fallback for Scene 1 failed: {e}")
+
+    # If Scene 1 wasn't a real photo, ensure it's hero
+    if not scene1_real_photo and validated[0]["type"] != "hero":
         first = validated[0]
         first["data"] = {"moment": "full view of the subject", "label": "", "callouts": [],
                          "icons": first["data"].get("icons") or ["sparkles"], **({"stamp": first["data"]["stamp"]} if first["data"].get("stamp") else {})}
@@ -1273,6 +1402,11 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
     for i, s in enumerate(scenes):
         if s["type"] != "photo":
             continue
+        if s["data"].get("path"):
+            full_existing = tpl / s["data"]["path"] if not Path(s["data"]["path"]).is_absolute() else Path(s["data"]["path"])
+            if full_existing.exists() and full_existing.stat().st_size > 0:
+                continue
+
         raw_query = s["data"].get("query") or s.get("photo_query") or s["data"].get("label") or s["text"]
 
         # Clean and target queries, enforcing human side for gaming / unfilmed subjects
@@ -1307,9 +1441,38 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
 
         out_jpg = media_dir / f"photo_scene_{i:02d}_{int(time.time())}.jpg"
         rel_path = f"assets/media/{out_jpg.name}"
+        raw_tmp = (out_dir or Path("/tmp")) / f"raw_photo_{i}_{int(time.time())}.jpg"
 
         success = False
-        if source and source[1]:  # has API key
+
+        # Try real photos (Openverse / Wikimedia Commons) first
+        if fetch_real_subject_photo:
+            try:
+                cand = fetch_real_subject_photo(query, raw_tmp)
+                if cand and raw_tmp.exists():
+                    if treat_script.exists():
+                        subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
+                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
+                    if burn_credit_line:
+                        burn_credit_line(out_jpg, cand["credit"])
+                    if out_jpg.exists() and out_jpg.stat().st_size > 0:
+                        s["data"]["path"] = rel_path
+                        s["data"]["credit"] = cand["credit"]
+                        s["data"]["creator"] = cand["creator"]
+                        s["data"]["license"] = cand["license"]
+                        s["data"]["source"] = cand["source"]
+                        s["data"]["title"] = cand["title"]
+                        if out_dir:
+                            shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
+                        success = True
+                        log(f"Photo scene {i} resolved with real {cand['source']} photo: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
+            except Exception as e:
+                log(f"Photo scene {i} real photo check failed: {e}")
+
+        # Fallback to stock footage / photo (Pixabay)
+        if not success and source and source[1]:  # has API key
             source_name, key, search_videos, search_photos = source
             try:
                 candidates = search_photos(query, key)
@@ -1326,15 +1489,21 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
                     used_photos.add(chosen.get("id"))
 
                 if chosen:
-                    raw_tmp = (out_dir or Path("/tmp")) / f"raw_photo_{i}.jpg"
                     stock_visuals._download(chosen["url"], raw_tmp)
                     if treat_script.exists():
                         subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
                                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     else:
                         _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
+                    credit_str = f"Stock: Pixabay ({chosen.get('user', 'Pixabay')})"
+                    if burn_credit_line:
+                        burn_credit_line(out_jpg, credit_str)
                     if out_jpg.exists() and out_jpg.stat().st_size > 0:
                         s["data"]["path"] = rel_path
+                        s["data"]["credit"] = credit_str
+                        s["data"]["creator"] = chosen.get("user", "Pixabay")
+                        s["data"]["license"] = "Pixabay Free"
+                        s["data"]["source"] = "pixabay"
                         if out_dir:
                             shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
                         success = True
@@ -1616,7 +1785,7 @@ def render_story(story_plan_file: Path, voiceover: Path, out_dir: Path, job_id: 
     t0 = time.time()
 
     cmd = [
-        "npx", "hyperframes", "render", ".",
+        "npx", "-y", "hyperframes", "render", ".",
         "--variables-file", "vars.json",
         "--end", str(duration),
         "-o", str(raw_mp4)

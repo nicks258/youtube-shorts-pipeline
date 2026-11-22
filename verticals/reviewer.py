@@ -33,8 +33,17 @@ except Exception:
         from config import get_gemini_key
         from log import log
     except Exception:
+        import os, pathlib, json
         def get_gemini_key():
-            return os.environ.get("GEMINI_API_KEY", "")
+            k = os.environ.get("GEMINI_API_KEY", "")
+            if not k:
+                try:
+                    cfg_path = pathlib.Path.home() / ".verticals" / "config.json"
+                    if cfg_path.exists():
+                        k = json.loads(cfg_path.read_text()).get("GEMINI_API_KEY", "")
+                except Exception:
+                    pass
+            return k
         def log(msg):
             print(f"[Reviewer] {msg}", file=sys.stderr)
 
@@ -55,6 +64,7 @@ PRICE_CNY_PER_M = {
     "Ling-3.1-flash-standard": {"input": 2.00, "output": 6.00},
     "Ling-3.2-flash": {"input": 2.00, "output": 6.00},
     "gemini": {"input": 0.54, "output": 2.16},  # approx CNY equivalent for Flash Lite
+    "gemini-decision-1": {"input": 0.714, "output": 0.0},  # $0.10 / 1M input tokens ($0 output)
 }
 CNY_TO_USD = 0.14
 
@@ -193,33 +203,12 @@ def _call_antling_chat(messages: list, model: str, max_tokens: int = 800) -> Tup
 def _call_gemini_chat(parts: list, model_kind: str = "text", max_tokens: int = 800) -> Tuple[Optional[str], dict]:
     """Call Gemini via Google API with fallback picking."""
     try:
-        from .gemini_model import _config, pick_model, REQUEST_TIMEOUT, API
+        from .gemini_model import generate
     except Exception:
-        from gemini_model import _config, pick_model, REQUEST_TIMEOUT, API
+        from gemini_model import generate
 
-    key = get_gemini_key()
-    if not key:
-        raise ValueError("GEMINI_API_KEY not configured")
-
-    model = pick_model(model_kind)
-    url = f"{API}/models/{model}:generateContent"
-    cfg = _config(model, max_tokens, 0.1)
-    r = requests.post(url, json={"contents": [{"parts": parts}], "generationConfig": cfg},
-                      headers={"x-goog-api-key": key}, timeout=REQUEST_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:200]}")
-
-    data = r.json()
-    candidates = data.get("candidates") or [{}]
-    out_parts = candidates[0].get("content", {}).get("parts", [])
-    text = " ".join(p.get("text", "") for p in out_parts if not p.get("thought")).strip()
-    usage_meta = data.get("usageMetadata", {})
-    usage = {
-        "prompt_tokens": usage_meta.get("promptTokenCount", 0),
-        "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
-        "total_tokens": usage_meta.get("totalTokenCount", 0),
-    }
-    return text, usage
+    text = generate(parts, max_tokens=max_tokens, temperature=0.1, kind=model_kind)
+    return text, {}
 
 
 # ── Review Execution Engine ──────────────────────────────────────────────────
@@ -360,19 +349,252 @@ def _execute_review(
     return final_verdict
 
 
+# ── Google Decisions API Reviewer ─────────────────────────────────────────────
+
+def _get_genai_client():
+    """Create a Google GenAI Client configured for Decisions API."""
+    from google import genai
+    key = get_gemini_key()
+    if not key:
+        raise ValueError("GEMINI_API_KEY not configured")
+    return genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+
+
+def _review_script_decisions(
+    script: str,
+    topic: str,
+    sources: Optional[List[Dict[str, Any]]] = None,
+) -> dict:
+    """Evaluate script quality checks using Google's Decisions API (gemini-decision-1).
+
+    All checks evaluated in a single request against a shared context:
+    - 5 noul questions:
+      1. subject named in first two sentences
+      2. every proper noun and jargon term explained
+      3. hook names the subject
+      4. closing question is specific not generic
+      5. every number appears in the provided sources
+    - 1 score question:
+      clarity score ("How well could someone who has never heard of this topic follow this script?")
+      with 4 levels from "completely lost" (0) to "fully clear" (3).
+
+    Branching logic:
+    - Fail if any noul < 0.5 OR clarity score < level 2.
+    - Where confidence < 0.6 on failing check, treat as soft fail.
+    """
+    client = _get_genai_client()
+
+    sources_summary = "\n".join(
+        f"- {s.get('title', '')}: {s.get('summary', '')}" for s in (sources or [])
+    ) or "(No separate sources provided; topic headline is the source)"
+
+    shared_input = f"Topic: {topic}\nSource Headlines: {sources_summary}\nScript: {script}"
+
+    questions = {
+        "subject_named_in_first_two": {
+            "type": "noul",
+            "instructions": "Is the specific subject (the show, place, landmark, company, or person) explicitly named by its actual specific name in the first two sentences?",
+        },
+        "every_proper_noun_and_jargon_explained": {
+            "type": "noul",
+            "instructions": "Is every proper noun, jargon term, or format rule clearly explained for a viewer who has never heard of this topic?",
+        },
+        "hook_names_subject": {
+            "type": "noul",
+            "instructions": "Does the opening hook sentence explicitly name the specific subject by name (e.g. not a vague pronoun or generic placeholder like 'This twist' or 'A bridge')?",
+        },
+        "closing_question_specific": {
+            "type": "noul",
+            "instructions": "Is the closing question specific to this exact story rather than a generic reused placeholder like 'What do you think? Comment below.'?",
+        },
+        "numbers_in_sources": {
+            "type": "noul",
+            "instructions": "Does every number, date, measurement, or statistic in the script appear in the provided sources or topic?",
+        },
+        "clarity_score": {
+            "type": "score",
+            "instructions": "How well could someone who has never heard of this topic follow this script?",
+            "criteria": ["completely lost", "somewhat confused", "mostly clear", "fully clear"],
+        },
+    }
+
+    resp = client.decisions.create(
+        model="gemini-decision-1",
+        input=shared_input,
+        questions=questions,
+    )
+
+    checks = {}
+    problems = []
+    is_pass = True
+    is_soft_fail = False
+    min_confidence = 1.0
+
+    noul_labels = {
+        "subject_named_in_first_two": "Subject named in the first two sentences",
+        "every_proper_noun_and_jargon_explained": "Every proper noun and jargon term explained",
+        "hook_names_subject": "Hook names the subject",
+        "closing_question_specific": "Closing question is specific not generic",
+        "numbers_in_sources": "Every number appears in the provided sources",
+    }
+
+    for q_key, label in noul_labels.items():
+        ans = resp.answers.get(q_key)
+        if ans:
+            prob = float(ans.noul)
+            conf = float(ans.confidence)
+            chk_pass = prob >= 0.5
+            checks[q_key] = {
+                "name": label,
+                "probability": prob,
+                "confidence": conf,
+                "pass": chk_pass,
+            }
+            if conf < min_confidence:
+                min_confidence = conf
+            if not chk_pass:
+                is_pass = False
+                problems.append(f"{label} failed (probability: {prob:.4f}, confidence: {conf:.4f})")
+                if conf < 0.6:
+                    is_soft_fail = True
+
+    clarity_ans = resp.answers.get("clarity_score")
+    clarity_score = 0.0
+    clarity_conf = 0.0
+    if clarity_ans:
+        clarity_score = float(clarity_ans.score)
+        clarity_conf = float(clarity_ans.confidence)
+        clarity_probs = dict(clarity_ans.probabilities or {})
+        prob_lost_or_confused = float(clarity_probs.get("0", 0.0) + clarity_probs.get("1", 0.0))
+
+        # Pass requires score >= 2.5 AND combined probability of levels 0 & 1 <= 0.35
+        clarity_pass = (clarity_score >= 2.5) and (prob_lost_or_confused <= 0.35)
+        checks["clarity_score"] = {
+            "name": "Clarity score (first-time viewer comprehension)",
+            "score": clarity_score,
+            "confidence": clarity_conf,
+            "pass": clarity_pass,
+            "prob_levels_0_1": prob_lost_or_confused,
+            "probabilities": clarity_probs,
+            "legend": dict(clarity_ans.legend or {}),
+        }
+
+        if not clarity_pass:
+            is_pass = False
+            if clarity_score < 2.5:
+                problems.append(f"Clarity score below threshold 2.5 (score: {clarity_score:.2f}/3.0)")
+            if prob_lost_or_confused > 0.35:
+                problems.append(f"High viewer confusion risk (combined level 0+1 probability: {prob_lost_or_confused:.2f} > 0.35)")
+            # Note: Do NOT set is_soft_fail based on score confidence.
+            # Confidence on score question represents the top level's probability (~0.35-0.50).
+            # Soft fail (< 0.6) applies exclusively to noul checks.
+
+    # Parse sentences for worst_sentence and fix_suggestion
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", script) if s.strip()]
+    worst_sentence = ""
+    fix_suggestions = []
+
+    if not is_pass:
+        if not checks.get("hook_names_subject", {}).get("pass", True) and sentences:
+            worst_sentence = sentences[0]
+            fix_suggestions.append("Rewrite the hook to explicitly name the subject.")
+        elif not checks.get("closing_question_specific", {}).get("pass", True) and sentences:
+            worst_sentence = sentences[-1]
+            fix_suggestions.append("Replace the generic closing question with a specific question about this topic.")
+        elif not checks.get("subject_named_in_first_two", {}).get("pass", True) and len(sentences) > 1:
+            worst_sentence = sentences[1]
+            fix_suggestions.append("Name the subject explicitly in the first two sentences.")
+        elif not checks.get("every_proper_noun_and_jargon_explained", {}).get("pass", True):
+            worst_sentence = sentences[0] if sentences else ""
+            fix_suggestions.append("Define proper nouns and jargon terms in a clear clause.")
+        elif not checks.get("clarity_score", {}).get("pass", True):
+            worst_sentence = sentences[0] if sentences else ""
+            fix_suggestions.append("Clarify the story narrative so a first-time viewer can follow effortlessly.")
+
+    fix_suggestion = " ".join(fix_suggestions) if fix_suggestions else ""
+
+    usage = resp.usage
+    p_in = usage.total_input_tokens if usage and usage.total_input_tokens else len(shared_input) // 4
+    p_out = 0
+    p_tot = p_in
+    cost_usd = round(p_in * (0.10 / 1_000_000), 6)
+    cost_cny = round(cost_usd * 7.14, 6)
+
+    verdict = {
+        "pass": is_pass,
+        "soft_fail": is_soft_fail,
+        "problems": problems,
+        "worst_sentence": worst_sentence,
+        "fix_suggestion": fix_suggestion,
+        "checks": checks,
+        "clarity_score": clarity_score,
+        "confidence": min_confidence,
+        "prompt_tokens": p_in,
+        "completion_tokens": p_out,
+        "total_tokens": p_tot,
+        "cost_usd": cost_usd,
+        "cost_cny": cost_cny,
+        "provider": "google-decisions",
+        "model": "gemini-decision-1",
+    }
+
+    entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "stage": "script",
+        "provider": "google-decisions",
+        "model": "gemini-decision-1",
+        "pass": is_pass,
+        "soft_fail": is_soft_fail,
+        "clarity_score": clarity_score,
+        "clarity_confidence": clarity_conf,
+        "checks": checks,
+        "problems": problems,
+        "worst_sentence": worst_sentence,
+        "fix_suggestion": fix_suggestion,
+        "prompt_tokens": p_in,
+        "completion_tokens": 0,
+        "total_tokens": p_tot,
+        "cost_cny": cost_cny,
+        "cost_usd": cost_usd,
+    }
+    _log_review_entry(entry)
+
+    return verdict
+
+
 # ── Public Review Functions ──────────────────────────────────────────────────
 
 def review_script(script: str, topic: str, sources: Optional[List[Dict[str, Any]]] = None) -> dict:
     """Run strict script review before TTS.
 
-    Checks:
-    1. Subject named explicitly in the first two sentences.
-    2. Every proper noun and piece of jargon explained.
-    3. A viewer who has never heard of the topic can follow it.
-    4. The hook names the subject.
-    5. Every number appears in the sources.
-    6. The closing question is specific, not a reused generic line.
+    Primary: Google's Decisions API (gemini-decision-1) evaluating all 5 noul checks
+    plus clarity scoring in a single request.
+    Fallback: Ling-3.2-flash / Ling-3.1-flash / Gemini chat if Decisions errors.
+    Never fails a run because a reviewer is unavailable.
     """
+    global _call_counter
+
+    if _call_counter >= MAX_CALLS_PER_VIDEO:
+        log(f"Hard cap of {MAX_CALLS_PER_VIDEO} reviews reached for this video. Skipping review.")
+        return {
+            "pass": True,
+            "problems": [],
+            "worst_sentence": "",
+            "fix_suggestion": "Review skipped: hard cap reached",
+            "skipped": True,
+        }
+
+    # Primary reviewer: Google's Decisions API (gemini-decision-1)
+    try:
+        _call_counter += 1
+        log(f"Running script review via Google Decisions API (call {_call_counter}/{MAX_CALLS_PER_VIDEO})...")
+        verdict = _review_script_decisions(script, topic, sources)
+        log(f"Google Decisions review finished: pass={verdict['pass']}, clarity={verdict.get('clarity_score', 0.0):.2f}, soft_fail={verdict.get('soft_fail', False)}")
+        return verdict
+    except Exception as e:
+        log(f"Google Decisions API review failed or unavailable ({e}). Falling back to Ling-3.2-flash/Gemini review.")
+
+    # Fallback to existing LLM JSON review
     sources_summary = "\n".join(
         f"- {s.get('title', '')}: {s.get('summary', '')}" for s in (sources or [])
     ) or "(No separate sources provided; topic headline is the source)"

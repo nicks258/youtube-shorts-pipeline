@@ -6,10 +6,12 @@ from unittest.mock import patch, MagicMock
 from verticals.draft import generate_draft
 
 
+@patch("verticals.reviewer.review_script", return_value={"pass": True, "problems": []})
+@patch("verticals.draft._check_confusion", return_value={"followable": True})
 class TestGenerateDraft:
     @patch("verticals.draft.research_topic")
     @patch("verticals.draft._call_claude")
-    def test_basic_draft_generation(self, mock_claude, mock_research):
+    def test_basic_draft_generation(self, mock_claude, mock_research, mock_confusion, mock_review):
         mock_research.return_value = "Some research data about the topic."
         mock_claude.return_value = json.dumps({
             "script": "This is a test script about AI.",
@@ -31,7 +33,7 @@ class TestGenerateDraft:
 
     @patch("verticals.draft.research_topic")
     @patch("verticals.draft._call_claude")
-    def test_handles_code_block_wrapper(self, mock_claude, mock_research):
+    def test_handles_code_block_wrapper(self, mock_claude, mock_research, mock_confusion, mock_review):
         mock_research.return_value = "research"
         mock_claude.return_value = '```json\n{"script":"test","broll_prompts":["p1","p2","p3"],"youtube_title":"T","youtube_description":"D","youtube_tags":"t","instagram_caption":"C","thumbnail_prompt":"P"}\n```'
 
@@ -40,7 +42,7 @@ class TestGenerateDraft:
 
     @patch("verticals.draft.research_topic")
     @patch("verticals.draft._call_claude")
-    def test_sanitizes_non_string_fields(self, mock_claude, mock_research):
+    def test_sanitizes_non_string_fields(self, mock_claude, mock_research, mock_confusion, mock_review):
         mock_research.return_value = "research"
         mock_claude.return_value = json.dumps({
             "script": 12345,  # non-string
@@ -59,7 +61,7 @@ class TestGenerateDraft:
 
     @patch("verticals.draft.research_topic")
     @patch("verticals.draft._call_claude")
-    def test_includes_channel_context(self, mock_claude, mock_research):
+    def test_includes_channel_context(self, mock_claude, mock_research, mock_confusion, mock_review):
         mock_research.return_value = "research"
         mock_claude.return_value = json.dumps({
             "script": "s", "broll_prompts": ["p1", "p2", "p3"],
@@ -75,7 +77,7 @@ class TestGenerateDraft:
 
     @patch("verticals.draft.research_topic")
     @patch("verticals.draft._call_claude")
-    def test_truncates_broll_prompts(self, mock_claude, mock_research):
+    def test_truncates_broll_prompts(self, mock_claude, mock_research, mock_confusion, mock_review):
         mock_research.return_value = "research"
         mock_claude.return_value = json.dumps({
             "script": "s",

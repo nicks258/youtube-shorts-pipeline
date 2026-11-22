@@ -11,8 +11,27 @@ import time
 
 import requests
 
-from .config import get_gemini_key
-from .log import log
+try:
+    from .config import get_gemini_key
+    from .log import log
+except Exception:
+    try:
+        from config import get_gemini_key
+        from log import log
+    except Exception:
+        import os, pathlib, json
+        def get_gemini_key():
+            k = os.environ.get("GEMINI_API_KEY", "")
+            if not k:
+                try:
+                    cfg_path = pathlib.Path.home() / ".verticals" / "config.json"
+                    if cfg_path.exists():
+                        k = json.loads(cfg_path.read_text()).get("GEMINI_API_KEY", "")
+                except Exception:
+                    pass
+            return k
+        def log(msg):
+            pass
 
 API = "https://generativelanguage.googleapis.com/v1beta"
 REQUEST_TIMEOUT = (10, 45)  # connect, read timeouts in seconds

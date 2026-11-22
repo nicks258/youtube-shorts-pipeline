@@ -33,8 +33,23 @@ except Exception:
     def log(msg: str):
         print(f"  [real_photos] {msg}", file=sys.stderr)
 
-USER_AGENT = "shorts-bot/1.0 (contact: info@unseenfacts.com)"
+USER_AGENT = "ShortsBot/1.0 (https://github.com/nicks258/my-shorts-bot; info@unseenfacts.com) Python-requests/2.31.0"
+BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 FLICKR_DEFAULT_KEY = "783d7d4a8ffdb1bf82c3526ffe2ca04a"
+
+def _download_image_bytes(url: str, timeout: int = 15) -> Optional[bytes]:
+    """Smart download trying Wikimedia-compliant UA or browser UA depending on host."""
+    uas = [USER_AGENT, BROWSER_UA]
+    if any(h in url for h in ("flickr.com", "inaturalist", "si.edu", "openaccess")):
+        uas = [BROWSER_UA, USER_AGENT]
+    for ua in uas:
+        try:
+            r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
+            if r.status_code == 200 and r.content:
+                return r.content
+        except Exception:
+            pass
+    return None
 
 # Rights-holder blocklist: skip regardless of declared license string
 RIGHTS_HOLDERS = {
@@ -98,31 +113,14 @@ def institutional_score(text: str) -> int:
 
 
 def search_wikimedia_commons_category(subject: str, limit: int = 20) -> list[dict]:
-    """Search Wikimedia Commons category members for exact subject name."""
+    """Search Wikimedia Commons category members for exact subject name or Wikidata P373 category directly."""
     if not subject or len(subject.strip()) < 3:
         return []
     base_url = "https://commons.wikimedia.org/w/api.php"
     candidates = []
     try:
-        # Search for exact or matching category
-        cat_params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": subject.strip(),
-            "srnamespace": "14",  # Category:
-            "format": "json"
-        }
-        r = requests.get(base_url, params=cat_params, headers={"User-Agent": USER_AGENT}, timeout=15)
-        if r.status_code != 200:
-            return []
-        hits = r.json().get("query", {}).get("search", [])
-        if not hits:
-            return []
-
-        # Check first matching category
-        cat_title = hits[0].get("title", "")
-        if not cat_title.startswith("Category:"):
-            return []
+        raw_s = subject.strip()
+        cat_title = raw_s if raw_s.startswith("Category:") else f"Category:{raw_s}"
 
         mem_params = {
             "action": "query",
@@ -135,15 +133,39 @@ def search_wikimedia_commons_category(subject: str, limit: int = 20) -> list[dic
             "format": "json"
         }
         r2 = requests.get(base_url, params=mem_params, headers={"User-Agent": USER_AGENT}, timeout=15)
-        if r2.status_code != 200:
-            return []
-        pages = r2.json().get("query", {}).get("pages", {})
+        pages = {}
+        if r2.status_code == 200:
+            pages = r2.json().get("query", {}).get("pages", {})
+
+        # If direct category had no files, search for exact category match
+        if not pages:
+            cat_params = {
+                "action": "query",
+                "list": "search",
+                "srsearch": raw_s.replace("Category:", ""),
+                "srnamespace": "14",  # Category:
+                "format": "json"
+            }
+            r = requests.get(base_url, params=cat_params, headers={"User-Agent": USER_AGENT}, timeout=15)
+            if r.status_code == 200:
+                hits = r.json().get("query", {}).get("search", [])
+                for hit in hits:
+                    ht = hit.get("title", "")
+                    if ht.startswith("Category:") and raw_s.lower().replace("category:", "") in ht.lower():
+                        cat_title = ht
+                        mem_params["gcmtitle"] = cat_title
+                        r_sub = requests.get(base_url, params=mem_params, headers={"User-Agent": USER_AGENT}, timeout=15)
+                        if r_sub.status_code == 200:
+                            sub_pages = r_sub.json().get("query", {}).get("pages", {})
+                            if sub_pages:
+                                pages = sub_pages
+                                break
 
         for pid, page in pages.items():
             ii = (page.get("imageinfo") or [{}])[0]
             img_url = ii.get("url")
             mime = str(ii.get("mime", "")).lower()
-            if not img_url or ("image" not in mime and not img_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
+            if not img_url or "svg" in mime or img_url.lower().endswith(".svg") or ("image" not in mime and not img_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
                 continue
 
             meta = ii.get("extmetadata", {})
@@ -336,7 +358,7 @@ def search_wikimedia_commons(query: str, limit: int = 20) -> list[dict]:
             ii = (page.get("imageinfo") or [{}])[0]
             img_url = ii.get("url")
             mime = str(ii.get("mime", "")).lower()
-            if not img_url or ("image" not in mime and not img_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
+            if not img_url or "svg" in mime or img_url.lower().endswith(".svg") or ("image" not in mime and not img_url.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))):
                 continue
 
             meta = ii.get("extmetadata", {})
@@ -396,37 +418,459 @@ def search_wikimedia_commons(query: str, limit: int = 20) -> list[dict]:
     return candidates
 
 
-def search_real_photo_candidates(query: str, subject_name: str = "", limit: int = 15) -> list[dict]:
-    """Search sources in priority order:
-    1. Commons Category (exact subject)
-    2. Flickr API (CC BY, PDM, US Gov; SA/ND excluded)
-    3. Openverse (cc0, pdm, by)
-    4. Wikimedia Commons (keyword search)
+# ---------------------------------------------------------------- specialist sources
+
+def search_nasa(query: str, entity_data: Optional[dict] = None, limit: int = 10) -> list[dict]:
+    """Search NASA Images API (images-api.nasa.gov).
+    Public domain (US Federal Government Work).
+    Skips items with third-party copyright in metadata, logos/insignias.
     """
+    search_q = query
+    if entity_data and entity_data.get("name"):
+        search_q = entity_data["name"]
+
+    candidates = []
+    url = "https://images-api.nasa.gov/search"
+    params = {"q": search_q, "media_type": "image"}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        items = data.get("collection", {}).get("items", [])
+        for it in items[:limit]:
+            d = it.get("data", [{}])[0]
+            links = it.get("links", [{}])
+            if not links:
+                continue
+            thumb_url = links[0].get("href", "")
+            title = d.get("title", "")
+            desc = d.get("description", "")
+            center = d.get("center", "NASA")
+
+            combined_text = f"{title} {desc} {center}".lower()
+            if any(term in combined_text for term in ("copyright", "(c)", "all rights reserved", "courtesy of")):
+                continue
+            if is_rights_holder(combined_text):
+                continue
+            if any(logo in combined_text for logo in ("meatball logo", "worm logo", "nasa insignia")):
+                continue
+
+            orig_url = thumb_url.replace("~thumb.jpg", "~large.jpg").replace("~medium.jpg", "~large.jpg")
+            credit = f"Photo: NASA / {center} (Public Domain)"
+
+            candidates.append({
+                "source": "nasa",
+                "title": title,
+                "creator": f"NASA / {center}",
+                "provider": "NASA Image and Video Library",
+                "license": "Public Domain",
+                "url": orig_url,
+                "thumb_url": thumb_url,
+                "credit": credit,
+                "score": 5,
+            })
+    except Exception as e:
+        log(f"NASA search failed for '{search_q}': {e}")
+    return candidates
+
+
+def search_inaturalist(query: str, entity_data: Optional[dict] = None, limit: int = 10) -> list[dict]:
+    """Search iNaturalist API (api.inaturalist.org) for research-grade observations.
+    Filters strictly to CC0 and CC-BY only (rejects CC-BY-NC, CC-BY-SA, All Rights Reserved).
+    Uses scientific name when available.
+    """
+    sci_name = entity_data.get("scientific_name") if entity_data else None
+    params = {
+        "quality_grade": "research",
+        "photos": "true",
+        "per_page": limit * 2,
+    }
+    if sci_name:
+        params["taxon_name"] = sci_name
+    else:
+        params["q"] = query
+
+    candidates = []
+    url = "https://api.inaturalist.org/v1/observations"
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        results = data.get("results", [])
+        for obs in results:
+            taxon = obs.get("taxon", {})
+            tax_name = taxon.get("name") or query
+            common_name = taxon.get("preferred_common_name")
+            display_title = f"{tax_name} ({common_name})" if common_name else tax_name
+
+            for photo in obs.get("photos", []):
+                lic_code = (photo.get("license_code") or "").lower()
+                if lic_code not in ("cc0", "cc-by"):
+                    continue
+
+                attr = photo.get("attribution") or obs.get("user", {}).get("name") or obs.get("user", {}).get("login") or "iNaturalist contributor"
+                if is_rights_holder(f"{display_title} {attr}"):
+                    continue
+
+                raw_url = photo.get("url", "")
+                if not raw_url:
+                    continue
+                large_url = raw_url.replace("square.jpg", "large.jpg").replace("small.jpg", "large.jpg")
+                lic_display = "CC0" if lic_code == "cc0" else "CC BY"
+                credit = f"Photo: {attr} / iNaturalist ({lic_display})"
+
+                candidates.append({
+                    "source": "inaturalist",
+                    "title": display_title,
+                    "creator": attr,
+                    "provider": "iNaturalist",
+                    "license": lic_display,
+                    "url": large_url,
+                    "thumb_url": raw_url,
+                    "credit": credit,
+                    "score": 5,
+                })
+                if len(candidates) >= limit:
+                    break
+            if len(candidates) >= limit:
+                break
+    except Exception as e:
+        log(f"iNaturalist search failed for '{query}': {e}")
+    return candidates
+
+
+def search_smithsonian(query: str, entity_data: Optional[dict] = None, limit: int = 10) -> list[dict]:
+    """Search Smithsonian Open Access API (api.si.edu/openaccess/api/v1.0).
+    Filters strictly to the CC0 Open Access subset.
+    """
+    api_key = os.environ.get("SMITHSONIAN_API_KEY", os.environ.get("DATA_GOV_API_KEY", "DEMO_KEY"))
+    search_q = query
+    if entity_data and entity_data.get("name"):
+        search_q = entity_data["name"]
+
+    candidates = []
+    url = "https://api.si.edu/openaccess/api/v1.0/search"
+    params = {
+        "api_key": api_key,
+        "q": search_q,
+        "online_media_type": "Images",
+        "rows": limit * 2,
+    }
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        rows = data.get("response", {}).get("rows", [])
+        for r_item in rows:
+            content = r_item.get("content", {})
+            usage_flags = content.get("indexedStructured", {}).get("usage_flag", [])
+            if "CC0" not in usage_flags:
+                continue
+
+            title = r_item.get("title", "")
+            if is_rights_holder(title):
+                continue
+
+            descriptive = content.get("descriptiveNonRepeating", {})
+            unit_code = descriptive.get("unit_code", "Smithsonian")
+            media = descriptive.get("online_media", {}).get("media", [])
+            if not media:
+                continue
+
+            img_url = media[0].get("content")
+            thumb_url = media[0].get("thumbnail") or img_url
+            if not img_url:
+                continue
+
+            credit = f"Photo: Smithsonian Institution / {unit_code} (CC0)"
+            candidates.append({
+                "source": "smithsonian",
+                "title": title,
+                "creator": f"Smithsonian Institution / {unit_code}",
+                "provider": "Smithsonian Open Access",
+                "license": "CC0",
+                "url": img_url,
+                "thumb_url": thumb_url,
+                "credit": credit,
+                "score": 5,
+            })
+            if len(candidates) >= limit:
+                break
+    except Exception as e:
+        log(f"Smithsonian search failed for '{search_q}': {e}")
+    return candidates
+
+
+def search_library_of_congress(query: str, entity_data: Optional[dict] = None, limit: int = 10) -> list[dict]:
+    """Library of Congress loc.gov JSON API.
+    Note: loc.gov is gated by Cloudflare Turnstile anti-bot challenge (HTTP 403).
+    Per Step 0 verification, automated HTTP queries fail closed.
+    """
+    return []
+
+
+def verify_relevance_gate_decisions(
+    b64_jpeg: str,
+    entity_name: str,
+    short_description: str,
+    narration_text: str = "",
+) -> tuple[str, float, float]:
+    """Check candidate relevance using Google Decisions API (gemini-decision-1).
+
+    Uses resolution='low' to keep cost down (~395 input tokens, $0.00004 USD).
+    Asks about the SCENE's subject using that scene's narration line.
+    Explicit true/false criteria:
+      true: the actual named subject
+      false: an unrelated object, logo, screenshot, or a different subject that merely shares a name
+    Returns: (decision_status, probability, confidence)
+      decision_status: 'ACCEPT' (>= 0.8), 'REJECT' (< 0.5), or 'BORDERLINE' (0.5 to 0.8).
+    """
+    try:
+        from .reviewer import _get_genai_client, _log_review_entry
+    except Exception:
+        try:
+            from reviewer import _get_genai_client, _log_review_entry
+        except Exception:
+            from verticals.reviewer import _get_genai_client, _log_review_entry
+
+    client = _get_genai_client()
+
+    desc_clause = f" ({short_description})" if short_description else ""
+    narr_clause = f', shown during narration: "{narration_text}"' if narration_text else ""
+    question_instruction = f"Does this image clearly show the scene subject: {entity_name}{desc_clause}{narr_clause}?"
+
+    resp = client.decisions.create(
+        model="gemini-decision-1",
+        input=[{
+            "type": "image",
+            "data": b64_jpeg,
+            "mime_type": "image/jpeg",
+            "resolution": "low",
+        }],
+        questions={
+            "image_relevance": {
+                "type": "noul",
+                "instructions": question_instruction,
+                "criteria": {
+                    "true_description": f"the actual named subject ({entity_name})",
+                    "false_description": "an unrelated object, logo, screenshot, or a different subject that merely shares a name",
+                },
+            }
+        },
+    )
+
+    ans = resp.answers.get("image_relevance")
+    prob = float(ans.noul) if ans else 0.0
+    conf = float(ans.confidence) if ans else 0.0
+
+    if prob >= 0.8:
+        status = "ACCEPT"
+    elif prob < 0.5:
+        status = "REJECT"
+    else:
+        status = "BORDERLINE"
+
+    try:
+        import datetime
+        inp_tokens = resp.usage.total_input_tokens if resp.usage and resp.usage.total_input_tokens else 395
+        cost_usd = round(inp_tokens * (0.10 / 1_000_000), 6)
+        entry = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "stage": "image_relevance",
+            "provider": "google-decisions",
+            "model": "gemini-decision-1",
+            "entity": entity_name,
+            "description": short_description,
+            "probability": prob,
+            "confidence": conf,
+            "status": status,
+            "pass": prob >= 0.5,
+            "prompt_tokens": inp_tokens,
+            "completion_tokens": 0,
+            "total_tokens": inp_tokens,
+            "cost_usd": cost_usd,
+            "cost_cny": round(cost_usd * 7.14, 6),
+        }
+        _log_review_entry(entry)
+    except Exception as e:
+        log(f"Failed to log image relevance entry: {e}")
+
+    return status, prob, conf
+
+
+def verify_relevance_gate(
+    img_url_or_path: str,
+    entity_name: str,
+    short_description: str,
+    narration_text: str = "",
+    candidate_title: str = "",
+    candidate_caption: str = "",
+) -> tuple[bool, str]:
+    """Check candidate relevance using Google Decisions API (gemini-decision-1)
+    with Ling-3.2-flash / Gemini vision fallback.
+    Accept >= 0.8, reject < 0.5, borderline (0.5 to 0.8).
+    """
+    if not entity_name:
+        return True, "YES (no entity specified)"
+    if str(img_url_or_path).lower().endswith(".svg"):
+        return False, "NO: SVG not supported"
+
+    # Pre-vision reject: corporate logos, software, screenshots, or graphics
+    cand_text = f"{candidate_title} {candidate_caption}".lower()
+    if any(junk in cand_text for junk in ("logo", "screenshot", "diagram", "graphic", "software", "microsystems", "google earth")):
+        if not any(k in entity_name.lower() for k in ("software", "company", "logo", "graphic")):
+            return False, "NO: Unrelated logo, screenshot, or graphic"
+
+    if entity_name.lower() in ("sun", "solar radiation") and any(bad in cand_text for bad in ("microsystems", "stanford", "coffee", "cup", "mug")):
+        return False, "NO: Different subject merely sharing a name"
+
+    try:
+        import io, base64
+        if img_url_or_path.startswith("http://") or img_url_or_path.startswith("https://"):
+            img_bytes = _download_image_bytes(img_url_or_path, timeout=15)
+            if not img_bytes:
+                return False, "NO: Download failed"
+        else:
+            img_bytes = Path(img_url_or_path).read_bytes()
+
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        long_side = max(im.size)
+        if long_side > 512:
+            scale = 512.0 / long_side
+            im = im.resize((max(1, int(im.width * scale)), max(1, int(im.height * scale))), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        # 1. Try Google Decisions API first
+        try:
+            status, prob, conf = verify_relevance_gate_decisions(
+                b64,
+                entity_name,
+                short_description,
+                narration_text=narration_text,
+            )
+            verdict = f"{status} (prob={prob:.4f}, conf={conf:.4f})"
+            return (status != "REJECT"), verdict
+        except Exception as e:
+            log(f"Decisions image relevance check error ({e}). Falling back to Ling-3.2-flash/Gemini vision.")
+
+        # 2. Fallback to Ling-3.2-flash or Gemini vision
+
+        desc_clause = f" ({short_description})" if short_description else ""
+        narr_clause = f", as described in: \"{narration_text}\"" if narration_text else ""
+        prompt = (
+            f"Does this image show {entity_name}{desc_clause}{narr_clause}?\n\n"
+            "Answer YES or NO first, followed by a brief 5-10 word reason.\n"
+            "Format: YES: <reason> or NO: <reason>\n"
+            "Answer NO if it shows an unrelated object, logo, screenshot, map/graphic, or a different subject that merely shares a name."
+        )
+
+        try:
+            from .reviewer import _call_antling_chat, _call_gemini_chat, _get_antling_key, ANTLING_VISION_MODEL
+        except Exception:
+            try:
+                from reviewer import _call_antling_chat, _call_gemini_chat, _get_antling_key, ANTLING_VISION_MODEL
+            except Exception:
+                from verticals.reviewer import _call_antling_chat, _call_gemini_chat, _get_antling_key, ANTLING_VISION_MODEL
+
+        if _get_antling_key():
+            messages = [
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]}
+            ]
+            resp, _ = _call_antling_chat(messages, model=ANTLING_VISION_MODEL, max_tokens=35)
+        else:
+            parts = [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
+            ]
+            resp, _ = _call_gemini_chat(parts, model_kind="vision", max_tokens=35)
+
+        cleaned = (resp or "").strip()
+        upper = cleaned.upper()
+        if upper.startswith("YES"):
+            return True, cleaned
+        return False, cleaned if cleaned else "NO: Does not show subject"
+    except Exception as e:
+        log(f"Relevance gate check error: {e}")
+        return False, f"NO: Error ({e})"
+
+
+def search_real_photo_candidates(
+    query: str,
+    subject_name: str = "",
+    category: str = "",
+    entity_data: Optional[dict] = None,
+    limit: int = 15,
+) -> list[dict]:
+    """Search sources according to specialist category priority:
+    - Space/Science -> NASA, Smithsonian, Commons Category, Flickr, Openverse, Commons Keyword
+    - Animals -> iNaturalist, Smithsonian, Commons Category, Flickr, Openverse, Commons Keyword
+    - History -> Library of Congress, Smithsonian, Commons Category, Flickr, Commons Keyword
+    - Everything else -> Commons Category, Flickr, Openverse, Commons Keyword
+    """
+    category_low = (category or "").lower()
+    sources_to_query = []
+
+    cat_target = (entity_data.get("commons_category") if entity_data else None) or subject_name
+
+    if any(k in category_low for k in ("space", "science", "astronomy")):
+        sources_to_query = [
+            lambda: search_nasa(query, entity_data, limit=limit),
+            lambda: search_smithsonian(query, entity_data, limit=limit),
+            lambda: search_wikimedia_commons_category(cat_target, limit=limit) if cat_target else [],
+            lambda: search_flickr(query, limit=limit),
+            lambda: search_openverse(query, limit=limit),
+            lambda: search_wikimedia_commons(query, limit=limit),
+        ]
+    elif any(k in category_low for k in ("animal", "wildlife", "nature", "biology")):
+        sources_to_query = [
+            lambda: search_inaturalist(query, entity_data, limit=limit),
+            lambda: search_smithsonian(query, entity_data, limit=limit),
+            lambda: search_wikimedia_commons_category(cat_target, limit=limit) if cat_target else [],
+            lambda: search_flickr(query, limit=limit),
+            lambda: search_openverse(query, limit=limit),
+            lambda: search_wikimedia_commons(query, limit=limit),
+        ]
+    elif any(k in category_low for k in ("history", "archaeology", "ancient")):
+        sources_to_query = [
+            lambda: search_library_of_congress(query, entity_data, limit=limit),
+            lambda: search_smithsonian(query, entity_data, limit=limit),
+            lambda: search_wikimedia_commons_category(cat_target, limit=limit) if cat_target else [],
+            lambda: search_flickr(query, limit=limit),
+            lambda: search_wikimedia_commons(query, limit=limit),
+        ]
+    else:
+        sources_to_query = [
+            lambda: search_wikimedia_commons_category(cat_target, limit=limit) if cat_target else [],
+            lambda: search_flickr(query, limit=limit),
+            lambda: search_openverse(query, limit=limit),
+            lambda: search_wikimedia_commons(query, limit=limit),
+        ]
+
     results = []
-
-    # 1. Wikimedia Commons Category Search
-    if subject_name:
-        results.extend(search_wikimedia_commons_category(subject_name, limit=limit))
-
-    # 2. Flickr API
-    results.extend(search_flickr(query, limit=limit))
-
-    # 3. Openverse
-    results.extend(search_openverse(query, limit=limit))
-
-    # 4. Wikimedia Commons Keyword Search
-    results.extend(search_wikimedia_commons(query, limit=limit))
+    for fetcher in sources_to_query:
+        try:
+            batch = fetcher()
+            if batch:
+                results.extend(batch)
+        except Exception as e:
+            log(f"Candidate search step failed: {e}")
 
     # Deduplicate by URL
     seen_urls = set()
     unique = []
     for r in results:
-        if r["url"] not in seen_urls:
+        if r.get("url") and r["url"] not in seen_urls:
             seen_urls.add(r["url"])
             unique.append(r)
 
-    # Sort descending by institutional score while maintaining source priority
     unique.sort(key=lambda x: x["score"], reverse=True)
     return unique
 
@@ -472,16 +916,103 @@ def burn_credit_line(image_path: Path, credit_text: str):
         log(f"Warning: could not burn credit line onto {image_path.name}: {e}")
 
 
-def fetch_real_subject_photo(query: str, out_path: Path, subject_name: str = "") -> Optional[dict]:
-    """Find, download, and credit a verified licensed photo for a query in priority order."""
-    candidates = search_real_photo_candidates(query, subject_name=subject_name)
+def fetch_real_subject_photo(
+    query: str,
+    out_path: Path,
+    subject_name: str = "",
+    category: str = "",
+    entity_data: Optional[dict] = None,
+    narration_text: str = "",
+    rejections_log: Optional[list] = None,
+) -> Optional[dict]:
+    """Find, download, and credit a verified licensed photo for a query in priority order.
+    Checks candidate relevance using Ling-3.2-flash / Gemini vision relevance gate (max 2 candidates).
+    """
+    candidates = search_real_photo_candidates(
+        query,
+        subject_name=subject_name,
+        category=category,
+        entity_data=entity_data,
+    )
+
+    entity_name = (entity_data.get("name") if entity_data else None) or subject_name or query
+    description = (entity_data.get("description") if entity_data else None) or ""
+
+    relevance_checks = 0
     for cand in candidates:
+        cand_title = cand.get("title", "")
+        cand_credit = cand.get("credit", "")
+        cand_text = f"{cand_title} {cand_credit}".lower()
+
+        # Reject candidates whose resolved caption or title differs from the scene's intended entity
+        if entity_data and entity_data.get("name"):
+            ent_name = entity_data["name"].lower()
+            mismatches = [
+                ("microsystems", ["microsystems"]),
+                ("google earth", ["google earth"]),
+                ("virtual map", ["virtual map"]),
+                ("coffee", ["coffee", "cup", "mug"]),
+                ("route 66", ["route 66"]),
+                ("operating system", ["operating system"]),
+            ]
+            differed = False
+            for marker, keywords in mismatches:
+                if any(k in cand_text for k in keywords) and not any(k in ent_name for k in keywords):
+                    cand["relevance_verdict"] = "NO: Resolved caption differs from intended entity"
+                    differed = True
+                    break
+            if differed:
+                log(f"Candidate '{cand_title}' rejected: caption differs from intended entity '{entity_data['name']}'")
+                if rejections_log is not None:
+                    rejections_log.append({
+                        "candidate": cand_title,
+                        "source": cand.get("source"),
+                        "entity": entity_data.get("name"),
+                        "reason": cand["relevance_verdict"]
+                    })
+                continue
+
+        # Check relevance gate (max 3 candidates checked per scene to control cost)
+        if entity_data:
+            relevance_checks += 1
+            thumb_target = cand.get("thumb_url") or cand.get("url")
+            passes, verdict = verify_relevance_gate(
+                thumb_target,
+                entity_name,
+                description,
+                narration_text=narration_text,
+                candidate_title=cand_title,
+                candidate_caption=cand_credit,
+            )
+            cand["relevance_verdict"] = verdict
+
+            if verdict.startswith("ACCEPT") or verdict.startswith("YES"):
+                pass
+            elif verdict.startswith("BORDERLINE"):
+                log(f"Candidate '{cand_title}' is borderline ({verdict}). Trying next candidate before falling back.")
+                if fallback_candidate is None:
+                    fallback_candidate = cand
+                if relevance_checks >= 3:
+                    break
+                continue
+            else:
+                log(f"Candidate '{cand_title}' rejected by relevance gate: {verdict}")
+                if rejections_log is not None:
+                    rejections_log.append({
+                        "candidate": cand_title,
+                        "source": cand.get("source"),
+                        "entity": entity_data.get("name"),
+                        "reason": verdict
+                    })
+                if relevance_checks >= 3:
+                    break
+                continue
+        else:
+            cand["relevance_verdict"] = "UNCHECKED"
+
         try:
-            r = requests.get(cand["url"], headers={"User-Agent": USER_AGENT}, timeout=25, stream=True)
-            if r.status_code == 200:
-                raw_bytes = r.content
-                if len(raw_bytes) < 10000:
-                    continue  # too small / corrupted
+            raw_bytes = _download_image_bytes(cand["url"], timeout=25)
+            if raw_bytes and len(raw_bytes) >= 10000:
                 out_path.write_bytes(raw_bytes)
                 # Verify PIL can open it
                 with Image.open(out_path) as im:
@@ -497,11 +1028,38 @@ def fetch_real_subject_photo(query: str, out_path: Path, subject_name: str = "")
                 # Burn on-screen credit
                 burn_credit_line(out_path, cand["credit"])
                 cand["path"] = str(out_path)
-                log(f"Found real photo from {cand['source']}: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
+                cand["is_authentic"] = True
+                log(f"Found real photo from {cand['source']}: '{cand['title']}' ({cand['license']}) by {cand['creator']} [Relevance: {cand.get('relevance_verdict')}]")
                 return cand
         except Exception as e:
             log(f"Download candidate {cand['url'][:50]} failed: {e}")
             if out_path.exists():
                 out_path.unlink(missing_ok=True)
+            if relevance_checks >= 3:
+                break
             continue
+
+    # Fall back to borderline candidate if no candidate scored >= 0.8
+    if fallback_candidate:
+        log(f"No candidate met >= 0.8 acceptance threshold. Falling back to borderline candidate '{fallback_candidate.get('title')}' ({fallback_candidate.get('relevance_verdict')}).")
+        try:
+            raw_bytes = _download_image_bytes(fallback_candidate["url"], timeout=25)
+            if raw_bytes and len(raw_bytes) >= 10000:
+                out_path.write_bytes(raw_bytes)
+                with Image.open(out_path) as im:
+                    im.verify()
+                with Image.open(out_path) as im:
+                    fallback_candidate["width"], fallback_candidate["height"] = im.size
+                    fallback_candidate["is_low_res"] = im.width < 720 or im.height < 720
+                    rgb = im.convert("RGB")
+                    rgb.save(out_path, "JPEG", quality=94)
+                burn_credit_line(out_path, fallback_candidate["credit"])
+                fallback_candidate["path"] = str(out_path)
+                fallback_candidate["is_authentic"] = True
+                return fallback_candidate
+        except Exception as e:
+            log(f"Fallback candidate download failed: {e}")
+            if out_path.exists():
+                out_path.unlink(missing_ok=True)
+
     return None

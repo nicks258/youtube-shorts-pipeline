@@ -9,6 +9,7 @@ Generates and renders a full-motion HyperFrames composition:
 - render_story: runs HyperFrames and muxes voiceover + ducked music
 """
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -19,6 +20,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# Ensure Homebrew and standard tool paths are accessible in child processes
+if "/opt/homebrew/bin" not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:{os.environ.get('PATH', '')}"
 
 # Local / pipeline relative imports
 try:
@@ -57,6 +62,14 @@ except Exception:
         fetch_real_subject_photo = None
         burn_credit_line = None
         search_real_photo_candidates = None
+
+try:
+    from .entity_resolver import resolve_entity
+except Exception:
+    try:
+        from entity_resolver import resolve_entity
+    except Exception:
+        resolve_entity = None
 
 
 VALID_SCENE_TYPES = {
@@ -581,12 +594,17 @@ def _validate_scene(s: dict, valid_icons: set[str]) -> dict:
             b=_clean_text(data.get("b", "Option B"), 25)
         )
 
-    return {
+    ret = {
         "text": text,
         "type": stype,
         "data": clean_data,
         "photo_query": _clean_text(s.get("photo_query") or data.get("photo_query") or text, 40)
     }
+    if s.get("entity") or data.get("entity"):
+        ret["entity"] = _clean_text(s.get("entity") or data.get("entity"), 80)
+    if s.get("entity_description") or data.get("entity_description"):
+        ret["entity_description"] = _clean_text(s.get("entity_description") or data.get("entity_description"), 120)
+    return ret
 
 
 def _enforce_variety(scenes: list[dict], valid_icons: set[str], cat_name: str = "") -> list[dict]:
@@ -667,16 +685,15 @@ def _enforce_variety(scenes: list[dict], valid_icons: set[str], cat_name: str = 
                     "label": scenes[i]["data"].get("label") or ""
                 }
 
-    # 4. Enforce 40-50% visual scenes (photo or hero)
+    # 4. Enforce at least 60% visual scenes (photo or hero), icons as last resort
     import math
-    target_min = math.ceil(total * 0.40)
-    target_max = round(total * 0.50)
+    target_min = math.ceil(total * 0.60)
 
     visual_indices = [i for i, s in enumerate(scenes) if s["type"] in ("hero", "photo")]
     while len(visual_indices) < target_min:
         candidates = [
             i for i, s in enumerate(scenes)
-            if s["type"] in ABSTRACT and s["type"] not in ("poll",) and i > 0
+            if s["type"] in ABSTRACT and s["type"] not in ("poll", "big_number") and i > 0
         ]
         if not candidates:
             break
@@ -686,35 +703,20 @@ def _enforce_variety(scenes: list[dict], valid_icons: set[str], cat_name: str = 
         ))
         scenes[best_cand]["type"] = "photo"
         scenes[best_cand]["data"] = {
-            "query": scenes[best_cand]["data"].get("query") or default_photo_query(scenes[best_cand]),
+            "query": scenes[best_cand]["data"].get("query") or (scenes[best_cand].get("entity") or default_photo_query(scenes[best_cand])),
             "label": scenes[best_cand]["data"].get("label") or ""
         }
         visual_indices = [i for i, s in enumerate(scenes) if s["type"] in ("hero", "photo")]
 
-    while len(visual_indices) > target_max:
-        photo_candidates = [i for i, s in enumerate(scenes) if s["type"] == "photo"]
-        if not photo_candidates:
-            break
-        chosen = None
-        for cand in reversed(photo_candidates):
-            left_abstract = 0
-            j = cand - 1
-            while j >= 0 and scenes[j]["type"] in ABSTRACT:
-                left_abstract += 1
-                j -= 1
-            right_abstract = 0
-            j = cand + 1
-            while j < total and scenes[j]["type"] in ABSTRACT:
-                right_abstract += 1
-                j += 1
-            if left_abstract + 1 + right_abstract <= 2:
-                chosen = cand
-                break
-        if chosen is None:
-            break
-        scenes[chosen]["type"] = "icon"
-        scenes[chosen]["data"] = {"icons": ["sparkles"], "label": scenes[chosen]["data"].get("label") or scenes[chosen]["text"]}
-        visual_indices = [i for i, s in enumerate(scenes) if s["type"] in ("hero", "photo")]
+    # 5. Any remaining icon or annotate scene with a specified entity should attempt photo sourcing
+    for s in scenes:
+        if s["type"] in ("icon", "annotate") and s.get("entity"):
+            s["type"] = "photo"
+            s["data"] = {
+                "query": s["data"].get("query") or s["entity"],
+                "label": s["data"].get("label") or "",
+                "entity": s["entity"]
+            }
 
     return scenes
 
@@ -889,6 +891,10 @@ The visual must change every {seconds_per_visual} seconds: split long sentences 
 or clause), never more than 9 words in one scene.
 Every single word of the narration must be included across the scenes in order with NO omissions and NO gaps.
 
+For EACH scene, also specify:
+- "entity": The specific real-world named entity or physical thing shown in THIS scene (e.g. "Wallis Annenberg Wildlife Crossing", "Cougar", "Extravehicular Mobility Unit", "NASA gold visor"), or null if abstract/generic.
+- "entity_description": A short 3-8 word description of what this entity is (e.g. "wildlife overpass in California", "mountain lion", "Apollo helmet visor").
+
 Scene Types (prioritize PREFERRED SCENE TYPES above):
 - photo: {{"query": "search query for real stock footage/photos", "label": "optional short label"}} -> Real footage or photography.
 - hero: {{"moment": "what the subject is doing/showing in THIS scene", "label": "optional kicker", "callouts": ["up to 3", "short chips"], "icons": ["fallback lucide icon"]}}
@@ -918,13 +924,13 @@ Scene Types (prioritize PREFERRED SCENE TYPES above):
 - poll: {{"question": "Which would you choose?", "a": "Option A", "b": "Option B"}} -> Interactive poll / question ending.
 
 Rules:
-1. Scene 1 MUST be a hero scene showing the subject clearly (full view).
-2. VISUAL MIX & FOOTAGE SEARCH TERMS (MANDATORY):
-   - 40% to 50% of all scenes MUST be REAL footage/photos ("photo") or AI hero images ("hero").
-   - NEVER place more than 2 designed/abstract scenes (icon, big_number, ui_card, checklist, network, compare) in a row.
-   - Use 2-3 hero scenes in total. (The same hero image may be used at most twice, and the second time must use a different framing: closeup, pan, or wide).
-   - The remaining visual scenes (3 to 5 scenes) MUST be "photo" scenes using real stock footage/photos.
-   - For every "photo" scene, provide data.query with specific 2-4 word stock search terms.
+1. Scene 1 MUST show the subject clearly (use "photo" if a real physical entity/species/place exists, otherwise "hero").
+2. VISUAL MIX & FOOTAGE SEARCH TERMS (MANDATORY - AT LEAST 60% VISUAL):
+   - At least 60% of all scenes MUST be REAL footage/photos ("photo") or AI hero images ("hero").
+   - Procedural icon scenes are the LAST RESORT, never the default. NEVER use "icon" to describe physical subjects, animals, places, people, objects, actions or environments.
+   - Designed/abstract scenes (big_number, compare, timeline, scale_compare) should ONLY be used when specifically highlighting real statistics, dates, or before/after numbers from the script. NEVER place more than 2 designed/abstract scenes in a row.
+   - Use 2-3 hero scenes in total when the subject is fictional or unfilmed. (The same hero image may be used at most twice, and the second time must use a different framing: closeup, pan, or wide).
+   - For every "photo" scene, provide data.query with specific 2-4 word stock search terms and set "entity" to the specific entity shown.
    - For topics where the subject itself cannot be filmed or shown (video games, unreleased movies, tech brands):
      Search for the HUMAN SIDE instead:
      * "people queuing store"
@@ -962,7 +968,7 @@ Respond with ONLY raw JSON:
   "real_subject_name": "exact real-world name or null",
   "series": false,
   "scenes": [
-    {{"text": "exact words spoken in this scene", "type": "hero | big_number | icon | ...", "data": {{ ... }}}}
+    {{"text": "exact words spoken in this scene", "type": "hero | big_number | icon | ...", "entity": "specific real entity or null", "entity_description": "short description or null", "data": {{ ... }}}}
   ]
 }}
 """
@@ -995,47 +1001,69 @@ Respond with ONLY raw JSON:
     # Resolve Scene 1 for real subjects:
     # Priority order: openverse/commons photo -> Pixabay footage -> AI hero image -> icon scene
     scene1_real_photo = None
+    rejections_log: list[dict] = []
     if is_real_thing and fetch_real_subject_photo:
-        query_candidates = [q for q in [real_subject_name, subject, title] if q and len(q) > 3]
+        scene0_ent = validated[0].get("entity") or real_subject_name or subject
+        ent_data = resolve_entity(scene0_ent) if (resolve_entity and scene0_ent) else None
+
         media_dir = get_story_template_dir() / "assets" / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
         treat_script = get_story_template_dir() / "tools" / "treat_photo.sh"
         raw_tmp = (out_dir or Path("/tmp")) / f"real_subject_scene0_{int(time.time())}.jpg"
         out_jpg = media_dir / f"photo_scene_00_{int(time.time())}.jpg"
 
-        for q in query_candidates:
-            cand = fetch_real_subject_photo(q, raw_tmp)
-            if cand and raw_tmp.exists():
-                try:
-                    if treat_script.exists():
-                        subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
-                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
-                    if burn_credit_line:
-                        burn_credit_line(out_jpg, cand["credit"])
-                    if out_jpg.exists() and out_jpg.stat().st_size > 0:
-                        rel_path = f"assets/media/{out_jpg.name}"
-                        validated[0]["type"] = "photo"
-                        validated[0]["data"] = {
-                            "path": rel_path,
-                            "query": q,
-                            "credit": cand["credit"],
-                            "creator": cand["creator"],
-                            "license": cand["license"],
-                            "source": cand["source"],
-                            "title": cand["title"],
-                            "is_real_subject": True
-                        }
-                        if out_dir:
-                            shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
-                        scene1_real_photo = cand
-                        log(f"Scene 1 resolved with real {cand['source']} photo: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
-                        break
-                except Exception as e:
-                    log(f"Restyling real subject photo failed: {e}")
+        cand = None
+        if ent_data:
+            cand = fetch_real_subject_photo(
+                scene0_ent,
+                raw_tmp,
+                subject_name=ent_data.get("name", scene0_ent),
+                category=cat_name,
+                entity_data=ent_data,
+                narration_text=validated[0].get("text", ""),
+                rejections_log=rejections_log
+            )
+        elif scene0_ent and len(scene0_ent) > 3:
+            log(f"Scene 1 entity '{scene0_ent}' could not be resolved - skipping Tier 1")
 
-        # Fallback to Pixabay footage if Openverse/Commons returned nothing
+        if cand and raw_tmp.exists():
+            try:
+                if treat_script.exists():
+                    subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
+                                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
+                if burn_credit_line:
+                    burn_credit_line(out_jpg, cand["credit"])
+                if out_jpg.exists() and out_jpg.stat().st_size > 0:
+                    rel_path = f"assets/media/{out_jpg.name}"
+                    validated[0]["type"] = "photo"
+                    validated[0]["data"] = {
+                        "path": rel_path,
+                        "query": scene0_ent,
+                        "credit": cand["credit"],
+                        "creator": cand["creator"],
+                        "license": cand["license"],
+                        "source": cand["source"],
+                        "title": cand["title"],
+                        "is_authentic": True,
+                        "caption": ent_data.get("name") if ent_data else cand["title"],
+                        "audit": {
+                            "source": cand["source"],
+                            "license": cand["license"],
+                            "creator": cand["creator"],
+                            "relevance_verdict": cand.get("relevance_verdict", "YES"),
+                            "final_type": "authentic"
+                        }
+                    }
+                    if out_dir:
+                        shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
+                    scene1_real_photo = cand
+                    log(f"Scene 1 resolved with authentic {cand['source']} photo: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
+            except Exception as e:
+                log(f"Restyling real subject photo failed: {e}")
+
+        # Fallback to Pixabay footage if specialist/commons returned nothing
         if not scene1_real_photo:
             try:
                 try:
@@ -1046,6 +1074,7 @@ Respond with ONLY raw JSON:
                     source = stock_visuals._stock_source()
                 if source and source[1]:
                     _, key, search_videos, search_photos = source
+                    query_candidates = [q for q in [real_subject_name, subject, title] if q and len(q) > 3]
                     for q in query_candidates[:2]:
                         cands = search_photos(q, key) or search_videos(q, key)
                         if cands:
@@ -1069,12 +1098,20 @@ Respond with ONLY raw JSON:
                                     "license": "Pixabay Free",
                                     "source": "pixabay",
                                     "title": q,
-                                    "is_real_subject": True
+                                    "is_authentic": False,
+                                    "caption": None,
+                                    "audit": {
+                                        "source": "pixabay",
+                                        "license": "Pixabay Free",
+                                        "creator": cands[0].get("user", "Pixabay"),
+                                        "relevance_verdict": "SKIPPED_GENERIC",
+                                        "final_type": "generic"
+                                    }
                                 }
                                 if out_dir:
                                     shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
                                 scene1_real_photo = {"source": "pixabay", "credit": credit_str, "creator": cands[0].get("user", "Pixabay"), "license": "Pixabay Free"}
-                                log("Scene 1 resolved with real Pixabay footage/photo")
+                                log("Scene 1 resolved with Pixabay generic footage/photo")
                                 break
             except Exception as e:
                 log(f"Pixabay fallback for Scene 1 failed: {e}")
@@ -1109,11 +1146,76 @@ Respond with ONLY raw JSON:
         _resolve_hero_scenes(scenes, subject, meta, out_dir, hero_style=hero_style, image_rules=image_rules)
 
     if any(s["type"] == "photo" for s in scenes):
-        _resolve_photo_scenes(scenes, out_dir, accent=accent, cat_name=cat_name)
+        _resolve_photo_scenes(
+            scenes,
+            out_dir,
+            accent=accent,
+            cat_name=cat_name,
+            main_entity_info=ent_data if is_real_thing else None,
+            video_subject=real_subject_name or subject,
+            rejections_log=rejections_log,
+        )
+
+    # Ensure every scene has an audit record and honest labels
+    for s in scenes:
+        stype = s.get("type", "")
+        sdata = s.setdefault("data", {})
+        if "audit" not in sdata:
+            if stype == "hero":
+                sdata["illustration"] = True
+                sdata["is_ai"] = True
+                sdata["audit"] = {
+                    "source": "pollinations_ai",
+                    "license": "Generated",
+                    "creator": "AI",
+                    "relevance_verdict": "AI_GENERATED",
+                    "final_type": "AI"
+                }
+            elif stype == "photo":
+                sdata["audit"] = {
+                    "source": sdata.get("source", "stock"),
+                    "license": sdata.get("license", "Unknown"),
+                    "creator": sdata.get("creator", "Unknown"),
+                    "relevance_verdict": "UNKNOWN",
+                    "final_type": "authentic" if sdata.get("is_authentic") else "generic"
+                }
+            else:
+                sdata["audit"] = {
+                    "source": "procedural",
+                    "license": "N/A",
+                    "creator": "System",
+                    "relevance_verdict": "N/A",
+                    "final_type": "procedural"
+                }
+
+    total_scenes_cnt = len(scenes)
+    authentic_scenes_cnt = sum(1 for s in scenes if s.get("data", {}).get("audit", {}).get("final_type") == "authentic")
+    auth_rate = (authentic_scenes_cnt / total_scenes_cnt) if total_scenes_cnt > 0 else 0.0
+    meta["authenticity_rate"] = round(auth_rate, 3)
+    meta["scenes_audit"] = [s.get("data", {}).get("audit") for s in scenes]
+    meta["rejections"] = rejections_log
+
+    try:
+        hist_log = Path(__file__).resolve().parent / "history" / "authenticity_log.jsonl"
+        hist_log.parent.mkdir(parents=True, exist_ok=True)
+        log_entry = {
+            "date": datetime.date.today().isoformat(),
+            "title": title,
+            "category": cat_name,
+            "total_scenes": total_scenes_cnt,
+            "authentic_scenes": authentic_scenes_cnt,
+            "authenticity_rate": round(auth_rate, 3),
+            "audits": meta["scenes_audit"],
+            "rejections": rejections_log
+        }
+        with hist_log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"Warning: could not write to authenticity_log: {e}")
 
     if out_dir:
         (Path(out_dir) / "story_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    log(f"Planned {len(scenes)} story scenes successfully.")
+    log(f"Planned {len(scenes)} story scenes successfully (authenticity rate: {auth_rate:.1%}).")
     return scenes
 
 
@@ -1376,7 +1478,13 @@ def _resolve_hero_scenes(scenes: list[dict], subject: str, meta: dict, out_dir: 
 
     for i in failed:
         if not approved:
-            _hero_to_icon(scenes[i])
+            # Fall back to photo scene so _resolve_photo_scenes can find real photos or reuse authentic images
+            scenes[i]["type"] = "photo"
+            scenes[i]["data"] = {
+                "query": scenes[i]["data"].get("query") or (scenes[i]["data"].get("moment") or scenes[i]["text"]),
+                "label": scenes[i]["data"].get("label") or "",
+                "entity": scenes[i].get("entity") or subject
+            }
             continue
         # Only reuse approved images that have been used < 2 times
         available = [src for src in approved if image_usage.get(scenes[src]["data"]["image"], 0) < 2]
@@ -1385,7 +1493,8 @@ def _resolve_hero_scenes(scenes: list[dict], subject: str, meta: dict, out_dir: 
             scenes[i]["type"] = "photo"
             scenes[i]["data"] = {
                 "query": scenes[i]["data"].get("query") or (scenes[i]["data"].get("moment") or scenes[i]["text"]),
-                "label": scenes[i]["data"].get("label") or ""
+                "label": scenes[i]["data"].get("label") or "",
+                "entity": scenes[i].get("entity") or subject
             }
             continue
         src = _pick_reuse_source(i, hero_order, available)
@@ -1416,8 +1525,19 @@ def _resolve_hero_scenes(scenes: list[dict], subject: str, meta: dict, out_dir: 
         f"{reused} reused with a new framing, {icons} icons")
 
 
-def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str = "#FFD666", cat_name: str = ""):
-    """Download and treat photos for any photo scenes using Pixabay + category restyling."""
+def _resolve_photo_scenes(
+    scenes: list[dict],
+    out_dir: Path | None,
+    accent: str = "#FFD666",
+    cat_name: str = "",
+    main_entity_info: dict | None = None,
+    video_subject: str = "",
+    rejections_log: list | None = None,
+):
+    """Download and treat photos for photo scenes using specialist sources, Wikidata entity resolution,
+    and multi-tier authentic fallback (reuse of approved authentic images, main entity search, Pixabay stock).
+    Procedural icon scenes are the last resort.
+    """
     tpl = get_story_template_dir()
     media_dir = tpl / "assets" / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -1436,6 +1556,25 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
             pass
 
     used_photos: set = set()
+
+    # Track approved authentic images from this video for reuse at different framings
+    approved_authentic: list[dict] = []
+    for s in scenes:
+        if s.get("type") == "photo" and s.get("data", {}).get("is_authentic") and s.get("data", {}).get("path"):
+            approved_authentic.append({
+                "path": s["data"]["path"],
+                "credit": s["data"].get("credit", ""),
+                "creator": s["data"].get("creator", ""),
+                "license": s["data"].get("license", ""),
+                "source": s["data"].get("source", ""),
+                "title": s["data"].get("title", ""),
+                "caption": s["data"].get("caption"),
+                "uses": 1
+            })
+
+    framing_pool = ("closeup", "pan", "wide")
+    reused_counter = 0
+
     for i, s in enumerate(scenes):
         if s["type"] != "photo":
             continue
@@ -1444,7 +1583,7 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
             if full_existing.exists() and full_existing.stat().st_size > 0:
                 continue
 
-        raw_query = s["data"].get("query") or s.get("photo_query") or s["data"].get("label") or s["text"]
+        raw_query = s["data"].get("query") or s.get("photo_query") or s["data"].get("label") or s.get("entity") or s["text"]
 
         # Clean and target queries, enforcing human side for gaming / unfilmed subjects
         query = str(raw_query).strip()
@@ -1482,10 +1621,23 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
 
         success = False
 
-        # Try real photos (Openverse / Wikimedia Commons) first
-        if fetch_real_subject_photo:
+        # TIER 1: Try scene's own resolved entity
+        scene_ent = s.get("entity") or s.get("data", {}).get("entity")
+        entity_info = None
+        if resolve_entity and scene_ent:
+            entity_info = resolve_entity(scene_ent)
+
+        if fetch_real_subject_photo and entity_info:
             try:
-                cand = fetch_real_subject_photo(query, raw_tmp)
+                cand = fetch_real_subject_photo(
+                    query,
+                    raw_tmp,
+                    subject_name=entity_info.get("name", query),
+                    category=cat_name,
+                    entity_data=entity_info,
+                    narration_text=s.get("text", ""),
+                    rejections_log=rejections_log
+                )
                 if cand and raw_tmp.exists():
                     if treat_script.exists():
                         subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
@@ -1501,14 +1653,120 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
                         s["data"]["license"] = cand["license"]
                         s["data"]["source"] = cand["source"]
                         s["data"]["title"] = cand["title"]
+                        s["data"]["is_authentic"] = True
+                        s["data"]["caption"] = entity_info.get("name")
+                        s["data"]["framing"] = "push"
+                        s["data"]["audit"] = {
+                            "source": cand["source"],
+                            "license": cand["license"],
+                            "creator": cand["creator"],
+                            "relevance_verdict": cand.get("relevance_verdict", "YES"),
+                            "final_type": "authentic"
+                        }
                         if out_dir:
                             shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
+                        approved_authentic.append({
+                            "path": rel_path,
+                            "credit": cand["credit"],
+                            "creator": cand["creator"],
+                            "license": cand["license"],
+                            "source": cand["source"],
+                            "title": cand["title"],
+                            "caption": entity_info.get("name"),
+                            "uses": 1
+                        })
                         success = True
-                        log(f"Photo scene {i} resolved with real {cand['source']} photo: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
+                        log(f"Photo scene {i} resolved with authentic {cand['source']} photo: '{cand['title']}' ({cand['license']}) by {cand['creator']}")
             except Exception as e:
                 log(f"Photo scene {i} real photo check failed: {e}")
 
-        # Fallback to stock footage / photo (Pixabay)
+        # TIER 2: Try VIDEO's main entity
+        # - Reuse an already-approved authentic image at a new crop (max twice per image, i.e. 3 total uses)
+        # - Or search for video's main entity
+        if not success:
+            reusable = [img for img in approved_authentic if img["uses"] < 3]
+            if reusable:
+                chosen_auth = min(reusable, key=lambda x: x["uses"])
+                framing = framing_pool[reused_counter % len(framing_pool)]
+                reused_counter += 1
+
+                s["data"]["path"] = chosen_auth["path"]
+                s["data"]["credit"] = chosen_auth["credit"]
+                s["data"]["creator"] = chosen_auth["creator"]
+                s["data"]["license"] = chosen_auth["license"]
+                s["data"]["source"] = chosen_auth["source"]
+                s["data"]["title"] = chosen_auth["title"]
+                s["data"]["is_authentic"] = True
+                s["data"]["caption"] = chosen_auth.get("caption")
+                s["data"]["framing"] = framing
+                s["data"]["reused_from"] = chosen_auth["path"]
+                s["data"]["audit"] = {
+                    "source": chosen_auth["source"],
+                    "license": chosen_auth["license"],
+                    "creator": chosen_auth["creator"],
+                    "relevance_verdict": f"REUSED_AUTHENTIC ({framing})",
+                    "final_type": "authentic"
+                }
+                chosen_auth["uses"] += 1
+                success = True
+                log(f"Photo scene {i} reused authentic photo '{chosen_auth['title']}' at '{framing}' framing (use {chosen_auth['uses']})")
+
+            elif fetch_real_subject_photo and (main_entity_info or video_subject):
+                m_info = main_entity_info or (resolve_entity(video_subject) if resolve_entity else None)
+                if m_info:
+                    try:
+                        cand = fetch_real_subject_photo(
+                            m_info.get("name", video_subject),
+                            raw_tmp,
+                            subject_name=m_info.get("name", video_subject),
+                            category=cat_name,
+                            entity_data=m_info,
+                            narration_text=s.get("text", ""),
+                            rejections_log=rejections_log
+                        )
+                        if cand and raw_tmp.exists():
+                            if treat_script.exists():
+                                subprocess.run(["bash", str(treat_script), str(raw_tmp), str(out_jpg), "1", accent],
+                                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            else:
+                                _ffmpeg_duotone(raw_tmp, out_jpg, accent=accent)
+                            if burn_credit_line:
+                                burn_credit_line(out_jpg, cand["credit"])
+                            if out_jpg.exists() and out_jpg.stat().st_size > 0:
+                                s["data"]["path"] = rel_path
+                                s["data"]["credit"] = cand["credit"]
+                                s["data"]["creator"] = cand["creator"]
+                                s["data"]["license"] = cand["license"]
+                                s["data"]["source"] = cand["source"]
+                                s["data"]["title"] = cand["title"]
+                                s["data"]["is_authentic"] = True
+                                s["data"]["caption"] = m_info.get("name")
+                                s["data"]["framing"] = "push"
+                                s["data"]["audit"] = {
+                                    "source": cand["source"],
+                                    "license": cand["license"],
+                                    "creator": cand["creator"],
+                                    "relevance_verdict": cand.get("relevance_verdict", "YES"),
+                                    "final_type": "authentic"
+                                }
+                                if out_dir:
+                                    shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
+                                approved_authentic.append({
+                                    "path": rel_path,
+                                    "credit": cand["credit"],
+                                    "creator": cand["creator"],
+                                    "license": cand["license"],
+                                    "source": cand["source"],
+                                    "title": cand["title"],
+                                    "caption": m_info.get("name"),
+                                    "uses": 1
+                                })
+                                success = True
+                                log(f"Photo scene {i} resolved with main entity authentic photo: '{cand['title']}'")
+                    except Exception as e:
+                        log(f"Photo scene {i} main entity check failed: {e}")
+
+        # TIER 3: Fallback to good generic stock footage/photo (uncaptioned)
         if not success and source and source[1]:  # has API key
             source_name, key, search_videos, search_photos = source
             try:
@@ -1516,8 +1774,14 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
                 if not candidates:
                     candidates = search_videos(query, key)
                 if not candidates:
-                    fallback_q = "neon city night" if "gaming" in cat_name.lower() else "gold bullion"
-                    candidates = search_photos(fallback_q, key)
+                    fallback_q = (
+                        "space stars galaxy" if "space" in cat_name.lower()
+                        else "rainforest jungle canopy" if "animal" in cat_name.lower()
+                        else "highway traffic freeway" if "crossing" in video_subject.lower() or "highway" in query.lower()
+                        else "neon city night" if "gaming" in cat_name.lower()
+                        else "gold bullion vault"
+                    )
+                    candidates = search_photos(fallback_q, key) or search_videos(fallback_q, key)
 
                 chosen = None
                 if candidates:
@@ -1541,12 +1805,23 @@ def _resolve_photo_scenes(scenes: list[dict], out_dir: Path | None, accent: str 
                         s["data"]["creator"] = chosen.get("user", "Pixabay")
                         s["data"]["license"] = "Pixabay Free"
                         s["data"]["source"] = "pixabay"
+                        s["data"]["is_authentic"] = False
+                        s["data"]["caption"] = None
+                        s["data"]["framing"] = "push"
+                        s["data"]["audit"] = {
+                            "source": "pixabay",
+                            "license": "Pixabay Free",
+                            "creator": chosen.get("user", "Pixabay"),
+                            "relevance_verdict": "SKIPPED_GENERIC",
+                            "final_type": "generic"
+                        }
                         if out_dir:
                             shutil.copy(out_jpg, Path(out_dir) / out_jpg.name)
                         success = True
             except Exception as e:
                 log(f"Photo scene {i} sourcing failed ({e})")
 
+        # TIER 4: Procedural icon scene as last resort
         if not success:
             _hero_to_icon(s)
 

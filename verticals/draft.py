@@ -480,10 +480,16 @@ Rewrite the script to be completely self-contained and fix all issues:
                 verdict_retry = review_script(draft_retry.get("script", ""), news, sources=sources)
                 draft_retry["review_verdict"] = verdict_retry
                 if not verdict_retry.get("pass", True):
-                    log(f"Regenerated script FAILED review twice: {verdict_retry.get('problems')}. Skipping topic.")
-                    _mark_topic_used(news)
-                    draft_retry["failed_review_twice"] = True
-                    draft_retry["skip_topic"] = True
+                    is_soft = verdict_retry.get("soft_fail", False) or (review_verdict and review_verdict.get("soft_fail", False))
+                    if is_soft:
+                        log(f"Regenerated script flagged with low confidence (< 0.6) on checks (soft fail): {verdict_retry.get('problems')}. Regenerated once; keeping topic.")
+                        draft_retry["soft_fail"] = True
+                        draft_retry["skip_topic"] = False
+                    else:
+                        log(f"Regenerated script FAILED review twice: {verdict_retry.get('problems')}. Skipping topic.")
+                        _mark_topic_used(news)
+                        draft_retry["failed_review_twice"] = True
+                        draft_retry["skip_topic"] = True
             draft = draft_retry
         except Exception as e:
             log(f"Script regeneration failed ({e}), keeping initial draft")

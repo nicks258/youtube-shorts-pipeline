@@ -24,11 +24,38 @@ import subprocess
 import requests
 from PIL import Image
 
-from . import broll as _broll
-from .assemble import _ffmpeg_has_libass, get_audio_duration
-from .assemble import assemble_video as _original_assemble
-from .config import MEDIA_DIR, VIDEO_HEIGHT, VIDEO_WIDTH, get_gemini_key, run_cmd
-from .log import log
+try:
+    from . import broll as _broll
+    from .assemble import _ffmpeg_has_libass, get_audio_duration
+    from .assemble import assemble_video as _original_assemble
+    from .config import MEDIA_DIR, VIDEO_HEIGHT, VIDEO_WIDTH, get_gemini_key, run_cmd
+    from .log import log
+except (ImportError, ValueError):
+    try:
+        import broll as _broll
+        from assemble import _ffmpeg_has_libass, get_audio_duration
+        from assemble import assemble_video as _original_assemble
+        from config import MEDIA_DIR, VIDEO_HEIGHT, VIDEO_WIDTH, get_gemini_key, run_cmd
+        from log import log
+    except Exception:
+        _broll = None
+        _ffmpeg_has_libass = lambda: False
+        get_audio_duration = lambda x: 0.0
+        _original_assemble = None
+        MEDIA_DIR = Path.home() / ".verticals" / "media"
+        VIDEO_HEIGHT, VIDEO_WIDTH = 1920, 1080
+        def get_gemini_key():
+            k = os.environ.get("GEMINI_API_KEY", "")
+            if not k:
+                try:
+                    cfg_path = Path.home() / ".verticals" / "config.json"
+                    if cfg_path.exists():
+                        k = json.loads(cfg_path.read_text()).get("GEMINI_API_KEY", "")
+                except Exception:
+                    pass
+            return k
+        def run_cmd(*args, **kwargs): pass
+        def log(msg): pass
 
 W, H = VIDEO_WIDTH, VIDEO_HEIGHT
 PLAN_FILE = "visual_plan.json"

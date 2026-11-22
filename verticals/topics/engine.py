@@ -105,15 +105,61 @@ class TopicEngine:
         unique.sort(key=lambda t: t.trending_score, reverse=True)
         return unique[:limit]
 
+    def score_topics_decisions(self, candidates: list[TopicCandidate]) -> list[TopicCandidate]:
+        """Score candidate headlines using Google's Decisions API (gemini-decision-1) in one call.
+
+        Evaluates each candidate headline for 'makes a good 40-second curiosity Short for a general audience'
+        with 4 rubric levels ('poor', 'fair', 'good', 'excellent').
+        """
+        if not candidates:
+            return candidates
+
+        try:
+            from ..reviewer import _get_genai_client
+            client = _get_genai_client()
+            top_candidates = candidates[:20]
+            questions = {}
+            for idx, cand in enumerate(top_candidates):
+                questions[f"cand_{idx}"] = {
+                    "type": "score",
+                    "instructions": f'Rate how well this topic headline makes a good 40-second curiosity Short for a general audience: "{cand.title}"',
+                    "criteria": ["poor", "fair", "good", "excellent"],
+                }
+
+            resp = client.decisions.create(
+                model="gemini-decision-1",
+                input="Auditing topic headlines for 40-second viral curiosity YouTube Shorts aimed at a broad casual audience.",
+                questions=questions,
+            )
+
+            for idx, cand in enumerate(top_candidates):
+                ans = resp.answers.get(f"cand_{idx}")
+                if ans and hasattr(ans, "score"):
+                    cand.metadata["curiosity_score"] = float(ans.score)
+                    cand.metadata["curiosity_confidence"] = float(ans.confidence)
+                    log(f"Topic [{cand.title[:45]}...] Decisions curiosity score: {ans.score:.2f} (conf: {ans.confidence:.2f})")
+        except Exception as e:
+            log(f"Topic ranking Decisions call failed or skipped ({e}) -- proceeding with default ranking")
+
+        return candidates
+
     def auto_pick(self, candidates: list[TopicCandidate], provider: str | None = None) -> str:
-        """Use configured LLM provider to pick the best topic for a YouTube Short."""
+        """Use Decisions API curiosity scoring alongside the existing Gemini choice step."""
+        if not candidates:
+            return ""
+
+        # Run one Decisions call scoring each candidate headline
+        self.score_topics_decisions(candidates)
+
         topics_text = "\n".join(
-            f"{i+1}. [{t.source}] {t.title} (score: {t.trending_score:.2f})"
+            f"{i+1}. [{t.source}] {t.title} ("
+            + (f"curiosity score: {t.metadata['curiosity_score']:.2f}/3.0, " if 'curiosity_score' in t.metadata else "")
+            + f"trending: {t.trending_score:.2f})"
             for i, t in enumerate(candidates[:20])
         )
 
-        prompt = f"""Pick the single best topic from this list for a viral YouTube Short (60-90 sec).
-Consider: visual potential, broad appeal, timeliness, controversy/surprise factor.
+        prompt = f"""Pick the single best topic from this list for a viral YouTube Short (40-60 sec).
+Consider: curiosity potential for a general audience, visual potential, timeliness, and the curiosity scores provided.
 
 {topics_text}
 

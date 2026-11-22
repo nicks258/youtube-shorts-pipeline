@@ -789,6 +789,42 @@ def _drop_redundant_labels(scenes: list[dict], script: str = ""):
                              if not _repeats_captions(c, spoken) and not _invents_numbers(c, script_numbers)]
 
 
+def _prevent_empty_scenes(scenes: list[dict], cat_name: str = ""):
+    """Ensure every scene carries either an image, a number, or real text content.
+
+    Replaces empty/low-content scenes (e.g. lone icon on black, empty glow, empty
+    BEFORE/AFTER panels) with photo scenes.
+    """
+    for s in scenes:
+        stype = s.get("type", "")
+        data = s.get("data") if isinstance(s.get("data"), dict) else {}
+        text = s.get("text", "")
+
+        if stype == "icon":
+            label = str(data.get("label") or "").strip()
+            # If label is empty, replace with a photo scene so there is never a lone icon on black
+            if not label:
+                words = [w for w in re.findall(r'[a-zA-Z]+', text) if len(w) > 3 and w.lower() not in STOPWORDS]
+                q = " ".join(words[:3]) if words else text[:30]
+                s["type"] = "photo"
+                s["data"] = {"query": q, "label": ""}
+
+        elif stype == "compare":
+            left = data.get("left") if isinstance(data.get("left"), dict) else {}
+            right = data.get("right") if isinstance(data.get("right"), dict) else {}
+            # If both details are empty, convert to photo rather than rendering empty panels
+            if not left.get("detail") and not right.get("detail"):
+                words = [w for w in re.findall(r'[a-zA-Z]+', text) if len(w) > 3 and w.lower() not in STOPWORDS]
+                q = " ".join(words[:3]) if words else text[:30]
+                s["type"] = "photo"
+                s["data"] = {"query": q, "label": ""}
+
+        elif stype == "silhouette":
+            if not data.get("label"):
+                s["type"] = "photo"
+                s["data"] = {"query": text[:30], "label": ""}
+
+
 def plan_story(script: str, title: str = "", out_dir: Path | None = None,
                category: str | None = None, draft: dict | None = None) -> list[dict]:
     """Single Gemini Flash Lite call to plan the entire Short scene by scene.
@@ -1051,6 +1087,7 @@ Respond with ONLY raw JSON:
         first["type"] = "hero"
     scenes = _enforce_variety(validated, valid_icons, cat_name=cat_name)
     _drop_redundant_labels(scenes, script)
+    _prevent_empty_scenes(scenes, cat_name=cat_name)
 
     heroes = sum(s["type"] == "hero" for s in scenes)
     log(f"Planned {len(scenes)} scenes, {heroes} hero. Subject: {subject} [category: {cat_name}, format: {format_id}]")

@@ -371,6 +371,12 @@ def search_wikimedia_commons(query: str, limit: int = 20) -> list[dict]:
             if is_rights_holder(f"{title} {artist}"):
                 continue
 
+            # Strict relevance: if searching for California/Los Angeles subjects, reject unrelated states
+            low_text = f"{title} {artist}".lower()
+            low_query = query.lower()
+            if any(term in low_query for term in ("california", "los angeles", "agoura", "101")) and any(other in low_text for other in ("oregon", "tillamook", "washington", "portland")):
+                continue
+
             score = institutional_score(f"{artist} {title}") + 1  # baseline commons boost
             lic_display = "Public Domain" if any(p in lic_low for p in ("pd", "public domain", "usgov")) else lic_name
             credit = f"Photo: {artist} / Commons ({lic_display})"

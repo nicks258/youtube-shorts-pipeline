@@ -3,6 +3,7 @@
 import base64
 import os
 from pathlib import Path
+from typing import Optional
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -122,20 +123,12 @@ def _wrap_text(draw: ImageDraw.Draw, text: str, font, max_width: int) -> list[st
     return lines
 
 
-def generate_thumbnail(draft: dict, out_dir: Path) -> Path:
-    """Generate a YouTube thumbnail with Gemini + text overlay.
+def generate_thumbnail(draft: dict, out_dir: Path, video_path: Optional[Path] = None) -> Path:
+    """Generate a YouTube thumbnail with Gemini + text overlay, with video frame fallback.
 
     Uses the thumbnail_prompt from the draft, overlays the video title.
     Returns path to the final thumbnail PNG.
     """
-    api_key = get_gemini_key()
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY not set — cannot generate thumbnail. Get an "
-            "AI Studio key at https://aistudio.google.com/apikey (Vertex AI / "
-            "service-account credentials are rejected with a 403 "
-            "'unregistered callers' error)."
-        )
     prompt = draft.get("thumbnail_prompt", "Cinematic YouTube thumbnail")
     title = draft.get("youtube_title", draft.get("news", ""))
     job_id = draft.get("job_id", "unknown")
@@ -143,8 +136,33 @@ def generate_thumbnail(draft: dict, out_dir: Path) -> Path:
     raw_path = out_dir / f"thumb_raw_{job_id}.png"
     final_path = out_dir / f"thumb_{job_id}.png"
 
-    log("Generating thumbnail via Gemini Imagen...")
-    _generate_thumb_image(prompt, raw_path, api_key)
+    thumb_generated = False
+    api_key = get_gemini_key()
+    if api_key:
+        try:
+            log("Generating thumbnail via Gemini Imagen...")
+            _generate_thumb_image(prompt, raw_path, api_key)
+            thumb_generated = True
+        except Exception as e:
+            log(f"Gemini thumbnail generation failed ({e}). Checking video frame fallback...")
+
+    if not thumb_generated:
+        if video_path and Path(video_path).is_file():
+            import subprocess
+            log(f"Extracting thumbnail frame from video ({video_path})...")
+            cmd = [
+                "ffmpeg", "-y", "-ss", "00:00:01", "-i", str(video_path),
+                "-vframes", "1",
+                "-vf", f"scale={THUMB_WIDTH}:{THUMB_HEIGHT}:force_original_aspect_ratio=increase,crop={THUMB_WIDTH}:{THUMB_HEIGHT}",
+                str(raw_path)
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode == 0 and raw_path.exists() and raw_path.stat().st_size > 0:
+                thumb_generated = True
+                log("Successfully extracted high-res frame from video for thumbnail.")
+
+    if not thumb_generated:
+        raise RuntimeError("Could not generate thumbnail from Gemini or video frame.")
 
     log("Adding title overlay...")
     _overlay_title(raw_path, title, final_path)

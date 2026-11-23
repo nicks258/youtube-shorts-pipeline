@@ -214,13 +214,18 @@ def cmd_upload(args):
     if privacy:
         draft["privacy_status"] = privacy
 
-    video_path = Path(draft.get(f"video_{lang}", ""))
-    srt_path_str = draft.get(f"srt_{lang}")
-    srt_path = Path(srt_path_str) if srt_path_str else None
-
-    if not video_path.exists():
+    video_path_str = getattr(args, "video", None) or draft.get(f"video_{lang}") or state.get_artifact("assemble", "video_path", "")
+    if not video_path_str:
         print(f"  No produced video found for lang={lang}. Run produce first.")
         sys.exit(1)
+
+    video_path = Path(video_path_str)
+    if not video_path.is_file():
+        print(f"  Produced video not found or not a valid file: {video_path}")
+        sys.exit(1)
+
+    srt_path_str = draft.get(f"srt_{lang}")
+    srt_path = Path(srt_path_str) if srt_path_str else None
 
     if draft.get("frame_review") and not draft["frame_review"].get("pass", True):
         log("Upload skipped: frame review failed. Video preserved as draft artifact.")
@@ -230,7 +235,7 @@ def cmd_upload(args):
     thumb_path = None
     if force or not state.is_done("thumbnail"):
         try:
-            thumb_path = generate_thumbnail(draft, MEDIA_DIR)
+            thumb_path = generate_thumbnail(draft, MEDIA_DIR, video_path=video_path)
             state.complete_stage("thumbnail", {"path": str(thumb_path)})
         except Exception as e:
             log(f"Thumbnail generation failed: {e} — uploading without thumbnail")
@@ -310,6 +315,10 @@ def cmd_run(args):
 
     video_path = cmd_produce(ProduceArgs())
 
+    # Reload draft to keep video_en, srt_en, and state stages populated by cmd_produce
+    if Path(draft_path).exists():
+        draft = json.loads(Path(draft_path).read_text(encoding="utf-8"))
+
     # Frame review after render, before upload (Ling-3.2-flash)
     try:
         from .reviewer import review_frames
@@ -317,6 +326,8 @@ def cmd_run(args):
         if sample_frames:
             f_verdict = review_frames(sample_frames, draft.get("script", ""), draft.get("news", ""))
             draft["frame_review"] = f_verdict
+            if video_path and not draft.get(f"video_{args.lang}"):
+                draft[f"video_{args.lang}"] = str(video_path)
             Path(draft_path).write_text(json.dumps(draft, indent=2, ensure_ascii=False), encoding="utf-8")
             if not f_verdict.get("pass", True):
                 print(f"\n  [FRAME REVIEW FAILED]: {f_verdict.get('problems')}")
@@ -330,6 +341,7 @@ def cmd_run(args):
         lang = args.lang
         force = False
         privacy = getattr(args, "privacy", None)
+        video = str(video_path) if video_path else None
 
     url = cmd_upload(UploadArgs())
     print(f"\n  Done! {url}")

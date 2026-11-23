@@ -170,7 +170,7 @@ def resize_frame_to_720_base64(frame_path: pathlib.Path | str) -> str:
 
 # ── API Calls ────────────────────────────────────────────────────────────────
 
-def _call_antling_chat(messages: list, model: str, max_tokens: int = 800) -> Tuple[Optional[str], dict]:
+def _call_antling_chat(messages: list, model: str, max_tokens: int = 4000) -> Tuple[Optional[str], dict]:
     """Call Ant Ling via OpenAI-compatible endpoint. Returns (content, usage_dict)."""
     api_key = _get_antling_key()
     if not api_key:
@@ -195,12 +195,15 @@ def _call_antling_chat(messages: list, model: str, max_tokens: int = 800) -> Tup
         raise RuntimeError(f"Ant Ling API error {r.status_code}: {r.text[:200]}")
 
     data = r.json()
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    msg = data.get("choices", [{}])[0].get("message", {})
+    content = msg.get("content", "") or ""
+    if not content.strip() and msg.get("reasoning_content"):
+        content = msg.get("reasoning_content")
     usage = data.get("usage", {})
     return content, usage
 
 
-def _call_gemini_chat(parts: list, model_kind: str = "text", max_tokens: int = 800) -> Tuple[Optional[str], dict]:
+def _call_gemini_chat(parts: list, model_kind: str = "text", max_tokens: int = 2000) -> Tuple[Optional[str], dict]:
     """Call Gemini via Google API with fallback picking."""
     try:
         from .gemini_model import generate
@@ -288,7 +291,13 @@ def _execute_review(
             _call_counter += 1
             raw_response, token_usage, used_model = prov_func()
             used_provider = prov_name
-            log(f"Review call succeeded using {used_provider} ({used_model}). Tokens: {token_usage}")
+            log(f"Review call completed using {used_provider} ({used_model}). Tokens: {token_usage}")
+
+            # If response is empty or whitespace, fail over to the next provider
+            if not raw_response or not raw_response.strip():
+                log(f"Provider '{prov_name}' returned empty response content. Falling back to next reviewer...")
+                continue
+
             results.append((prov_name, raw_response, token_usage, used_model))
             if provider_choice != "both":
                 break

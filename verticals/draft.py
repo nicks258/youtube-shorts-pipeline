@@ -480,9 +480,13 @@ Rewrite the script to be completely self-contained and fix all issues:
                 verdict_retry = review_script(draft_retry.get("script", ""), news, sources=sources)
                 draft_retry["review_verdict"] = verdict_retry
                 if not verdict_retry.get("pass", True):
-                    is_soft = verdict_retry.get("soft_fail", False) or (review_verdict and review_verdict.get("soft_fail", False))
+                    is_soft = (
+                        verdict_retry.get("soft_fail", False)
+                        or (review_verdict and review_verdict.get("soft_fail", False))
+                        or ("Unparseable review verdict" in verdict_retry.get("problems", []))
+                    )
                     if is_soft:
-                        log(f"Regenerated script flagged with low confidence (< 0.6) on checks (soft fail): {verdict_retry.get('problems')}. Regenerated once; keeping topic.")
+                        log(f"Regenerated script flagged with low confidence (< 0.6) or reviewer parse glitch (soft fail): {verdict_retry.get('problems')}. Regenerated once; keeping topic.")
                         draft_retry["soft_fail"] = True
                         draft_retry["skip_topic"] = False
                     else:

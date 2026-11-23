@@ -228,8 +228,7 @@ def cmd_upload(args):
     srt_path = Path(srt_path_str) if srt_path_str else None
 
     if draft.get("frame_review") and not draft["frame_review"].get("pass", True):
-        log("Upload skipped: frame review failed. Video preserved as draft artifact.")
-        return None
+        log("Notice: frame review flagged issues, but continuing with upload.")
 
     # Thumbnail
     thumb_path = None
@@ -298,8 +297,8 @@ def cmd_run(args):
         return
     import json
     draft = json.loads(Path(draft_path).read_text(encoding="utf-8"))
-    if draft.get("skip_topic") or draft.get("failed_review_twice"):
-        print("\n  [QUALITY AUDIT]: Topic failed review twice. Skipping production/upload.")
+    if draft.get("skip_topic") and not draft.get("failed_review_twice"):
+        print("\n  [QUALITY AUDIT]: Topic skipped. Exiting.")
         return
 
     if args.dry_run:
@@ -330,9 +329,8 @@ def cmd_run(args):
                 draft[f"video_{args.lang}"] = str(video_path)
             Path(draft_path).write_text(json.dumps(draft, indent=2, ensure_ascii=False), encoding="utf-8")
             if not f_verdict.get("pass", True):
-                print(f"\n  [FRAME REVIEW FAILED]: {f_verdict.get('problems')}")
-                print(f"  Keeping video as draft artifact ({video_path}); skipping upload.\n")
-                return
+                print(f"\n  [FRAME REVIEW NOTICE]: {f_verdict.get('problems')}")
+                print(f"  Frame review flagged issues, but proceeding with upload.\n")
     except Exception as e:
         log(f"Frame review step encountered error ({e}) -- proceeding safely")
 

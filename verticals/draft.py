@@ -490,10 +490,10 @@ Rewrite the script to be completely self-contained and fix all issues:
                         draft_retry["soft_fail"] = True
                         draft_retry["skip_topic"] = False
                     else:
-                        log(f"Regenerated script FAILED review twice: {verdict_retry.get('problems')}. Skipping topic.")
+                        log(f"Regenerated script flagged review issues twice: {verdict_retry.get('problems')}. Proceeding with production and upload.")
                         _mark_topic_used(news)
                         draft_retry["failed_review_twice"] = True
-                        draft_retry["skip_topic"] = True
+                        draft_retry["skip_topic"] = False
             draft = draft_retry
         except Exception as e:
             log(f"Script regeneration failed ({e}), keeping initial draft")

@@ -187,7 +187,7 @@ def _call_antling_chat(messages: list, model: str, max_tokens: int = 4000) -> Tu
         "max_tokens": max_tokens,
         "temperature": 0.1,
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=(10, 45))
+    r = requests.post(url, headers=headers, json=payload, timeout=(15, 120))
     if r.status_code == 402 or "quota" in r.text.lower() or "billing" in r.text.lower():
         log(f"Ant Ling quota/billing error HTTP {r.status_code}: {r.text[:200]}")
         raise RuntimeError(f"Ant Ling quota/billing error: {r.text[:200]}")

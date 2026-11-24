@@ -343,8 +343,39 @@ CRITICAL ACCURACY REQUIREMENT:
 - Hashtags: Use {theme.get('hashtags', [])}
 """
 
+    # ── Hook selection & variety enforcement ──────────────────────────────
+    chosen_hook = {}
+    rejected_jokes = []
+    try:
+        from hooks import generate_hook_candidates, score_and_select_hook, get_last_hook_format
+        disallowed_fmt = get_last_hook_format(niche)
+        cands = generate_hook_candidates(news, niche, research)
+        chosen_hook, _, rejected_jokes = score_and_select_hook(
+            cands, news, niche, research, disallowed_format=disallowed_fmt
+        )
+    except Exception:
+        try:
+            import hooks
+            disallowed_fmt = hooks.get_last_hook_format(niche)
+            cands = hooks.generate_hook_candidates(news, niche, research)
+            chosen_hook, _, rejected_jokes = hooks.score_and_select_hook(
+                cands, news, niche, research, disallowed_format=disallowed_fmt
+            )
+        except Exception:
+            chosen_hook = {}
+            rejected_jokes = []
+
+    hook_prompt_instruction = ""
+    if chosen_hook.get("spoken_hook"):
+        hook_prompt_instruction = f"""
+HOOK REQUIREMENT (MANDATORY):
+- The FIRST sentence of the script MUST be this exact spoken hook (12 words or fewer): "{chosen_hook['spoken_hook']}".
+- Do not alter or lengthen this first sentence.
+"""
+
     target_words = min(max_words, int(os.environ.get('SCRIPT_WORDS', '86')))
     prompt = f"""You are writing a {platform_label} script (strictly 82-90 words, target ~86 words, ~35-42 seconds spoken; NEVER exceed 45 seconds). The FIRST sentence must be a scroll-stopping hook of under 10 words that creates curiosity, and every sentence must give the viewer a reason to keep watching.{channel_note}
+{hook_prompt_instruction}
 
 {script_context}
 
@@ -556,6 +587,11 @@ Fix the script now so that:
     draft["research"] = research
     draft["niche"] = niche
     draft["platform"] = platform
+    if chosen_hook:
+        draft["hook_format"] = chosen_hook.get("format", "")
+        draft["spoken_hook"] = chosen_hook.get("spoken_hook", "")
+        draft["hook_text"] = chosen_hook.get("on_screen_text", "")
+        draft["rejected_jokes"] = rejected_jokes
     try:
         from .hashtags import apply_hashtags_to_draft
         apply_hashtags_to_draft(draft, category=niche)

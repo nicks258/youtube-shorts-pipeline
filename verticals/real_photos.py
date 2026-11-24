@@ -745,21 +745,7 @@ def verify_relevance_gate(
         im.save(buf, format="JPEG", quality=80)
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # 1. Try Google Decisions API first
-        try:
-            status, prob, conf = verify_relevance_gate_decisions(
-                b64,
-                entity_name,
-                short_description,
-                narration_text=narration_text,
-            )
-            verdict = f"{status} (prob={prob:.4f}, conf={conf:.4f})"
-            return (status != "REJECT"), verdict
-        except Exception as e:
-            log(f"Decisions image relevance check error ({e}). Falling back to Ling-3.2-flash/Gemini vision.")
-
-        # 2. Fallback to Ling-3.2-flash or Gemini vision
-
+        # Vision relevance check: Ling-3.2-flash or Gemini vision
         desc_clause = f" ({short_description})" if short_description else ""
         narr_clause = f", as described in: \"{narration_text}\"" if narration_text else ""
         prompt = (
@@ -939,6 +925,7 @@ def fetch_real_subject_photo(
     description = (entity_data.get("description") if entity_data else None) or ""
 
     relevance_checks = 0
+    fallback_candidate = None
     for cand in candidates:
         cand_title = cand.get("title", "")
         cand_credit = cand.get("credit", "")

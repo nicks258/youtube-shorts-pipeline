@@ -27,8 +27,8 @@ def _get_pipeline(lang_code: str):
 
 
 def _split_and_merge_sentences(script: str) -> list[str]:
-    """Split script into sentences after . ! ? followed by space, merging sentences < 4 words."""
-    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", script.strip()) if s.strip()]
+    """Split script into sentences after . ! ? । followed by space, merging sentences < 4 words."""
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?।])\s+", script.strip()) if s.strip()]
     if not raw_sentences:
         return []
 
@@ -173,14 +173,21 @@ def generate_kokoro(script: str, out_dir: Path, lang: str = "en") -> Path:
     else:
         all_rates = [rec["rate"] for rec in sentence_records]
         target_rate = float(np.median(all_rates))
-        target_rate = max(2.4, min(3.0, target_rate))
+        if speed > 1.0:
+            target_rate = max(2.4 * speed, min(3.5 * speed, target_rate))
+        else:
+            target_rate = max(2.4, min(3.0, target_rate))
 
     # Time-stretch sentences if rate differs from target rate
     processed_sentences = []
     for i, rec in enumerate(sentence_records, start=1):
         orig_rate = rec["rate"]
         factor = target_rate / orig_rate
-        clamped_factor = max(0.85, min(1.15, factor))
+        # For accelerated speed or Hindi, never slow down sentences in post-processing
+        if speed >= 1.15 or lang == "hi" or lang_code == "h":
+            clamped_factor = max(1.0, min(1.15, factor))
+        else:
+            clamped_factor = max(0.85, min(1.15, factor))
 
         stretched_audio = _stretch_audio(rec["audio"], clamped_factor, sample_rate)
         final_seconds = max(len(stretched_audio) / sample_rate, 0.01)
